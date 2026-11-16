@@ -32,6 +32,9 @@ coverage/
 .env.*
 !.env.example
 
+# Editors
+.idea/
+
 # OS
 .DS_Store
 Thumbs.db
