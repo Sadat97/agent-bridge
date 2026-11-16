@@ -20,6 +20,8 @@ export interface AuthedDevice {
 declare module 'fastify' {
   interface FastifyRequest {
     device: AuthedDevice;
+    /** Unix seconds. Set by requireDevice from the bearer token. */
+    tokenExpiresAt: number;
   }
 }
 
@@ -32,8 +34,12 @@ export function issueAccessToken(secret: Uint8Array, deviceId: string, expiresAt
   return `v1.${payload}.${toBase64Url(mac(secret, `v1.${payload}`))}`;
 }
 
-/** Returns the device id, or null for a malformed, forged, or expired token. */
-export function verifyAccessToken(secret: Uint8Array, token: string, nowSeconds: number): string | null {
+/** Returns the device id and expiry, or null for a malformed, forged, or expired token. */
+export function verifyAccessToken(
+  secret: Uint8Array,
+  token: string,
+  nowSeconds: number,
+): { deviceId: string; expiresAt: number } | null {
   const parts = token.split('.');
   if (parts.length !== 3 || parts[0] !== 'v1') return null;
   const [, payload, signature] = parts as [string, string, string];
@@ -42,11 +48,22 @@ export function verifyAccessToken(secret: Uint8Array, token: string, nowSeconds:
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
   try {
     const { d, e } = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { d: unknown; e: unknown };
-    if (typeof d !== 'string' || typeof e !== 'number' || e <= nowSeconds) return null;
-    return normalizeUuid(d);
+    if (typeof d !== 'string' || typeof e !== 'number' || !Number.isSafeInteger(e) || e <= nowSeconds) return null;
+    const deviceId = normalizeUuid(d);
+    return deviceId === null ? null : { deviceId, expiresAt: e };
   } catch {
     return null;
   }
+}
+
+/**
+ * Locks the device row for the rest of the transaction so per-device rate
+ * limits cannot be bypassed by parallel requests. False when the device is
+ * unknown or revoked.
+ */
+export async function lockLiveDevice(db: Queryable, deviceId: string): Promise<boolean> {
+  const { rowCount } = await db.query('SELECT 1 FROM devices WHERE id = $1 AND revoked_at IS NULL FOR UPDATE', [deviceId]);
+  return rowCount === 1;
 }
 
 export async function loadDevice(db: Queryable, deviceId: string): Promise<AuthedDevice | null> {
@@ -83,10 +100,11 @@ export function requireDevice(ctx: RelayContext) {
     const header = request.headers.authorization;
     const match = header?.match(/^Bearer ([A-Za-z0-9._-]+)$/);
     if (!match) throw unauthorized();
-    const deviceId = verifyAccessToken(ctx.config.tokenSecret, match[1]!, nowSeconds(ctx));
-    if (!deviceId) throw unauthorized('invalid or expired access token');
-    const device = await loadDevice(ctx.pool, deviceId);
+    const verified = verifyAccessToken(ctx.config.tokenSecret, match[1]!, nowSeconds(ctx));
+    if (!verified) throw unauthorized('invalid or expired access token');
+    const device = await loadDevice(ctx.pool, verified.deviceId);
     if (!device) throw unauthorized('device unknown or revoked');
     request.device = device;
+    request.tokenExpiresAt = verified.expiresAt;
   };
 }

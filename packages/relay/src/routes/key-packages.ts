@@ -9,12 +9,13 @@ import {
   toBase64,
   verifyWithLabel,
 } from '@agent-bridge/protocol';
-import { nowSeconds, requireDevice } from '../auth.ts';
+import { lockLiveDevice, nowSeconds, requireDevice } from '../auth.ts';
 import type { RelayContext } from '../context.ts';
 import { bytes, withTransaction } from '../db.ts';
 import type { Queryable } from '../db.ts';
-import { badRequest, conflict, forbidden, notFound, RelayError, tooManyRequests } from '../errors.ts';
-import { approvalIdSchema, base64Schema, decodeBase64Field, parseUuid, uuidSchema } from '../validate.ts';
+import { deliver } from '../deliver.ts';
+import { badRequest, conflict, forbidden, notFound, RelayError, tooManyRequests, unauthorized } from '../errors.ts';
+import { approvalIdSchema, base64Schema, decodeBase64Field, parseUuid, uniqueViolation, uuidSchema } from '../validate.ts';
 import { loadMembership } from './topics.ts';
 
 const MAX_KEY_PACKAGE_BYTES = 16 * 1024;
@@ -119,6 +120,9 @@ export function keyPackageRoutes(app: FastifyInstance, ctx: RelayContext): void 
       const now = ctx.now();
 
       const result = await withTransaction(ctx.pool, async (db) => {
+        // One claimer at a time, so the cap and the "same approval returns the same package" check are atomic.
+        if (!(await lockLiveDevice(db, caller.id))) throw unauthorized('device unknown or revoked');
+
         const membership = await loadMembership(db, topicId, caller.id);
         if (!membership) throw notFound();
         if (membership.owner_account !== caller.accountId) {
@@ -152,10 +156,12 @@ export function keyPackageRoutes(app: FastifyInstance, ctx: RelayContext): void 
         ]);
         if (used.rowCount) throw conflict('approval_used', 'this approval was already used in a commit');
 
-        // A retried claim for the same approval gets the same KeyPackage back.
+        // A retry of the same approval on the same topic returns the same KeyPackage.
+        // approval_id is only unique per topic, so the topic is part of the key.
         const previous = await db.query<{ key_package: Buffer }>(
-          'SELECT key_package FROM key_packages WHERE device_id = $1 AND claimed_by = $2 AND claim_approval_id = $3',
-          [targetId, caller.id, approvalId],
+          `SELECT key_package FROM key_packages
+            WHERE device_id = $1 AND claimed_by = $2 AND claim_topic_id = $3 AND claim_approval_id = $4`,
+          [targetId, caller.id, topicId, approvalId],
         );
         if (previous.rows[0]) return { keyPackage: bytes(previous.rows[0].key_package), remaining: null };
 
@@ -167,15 +173,29 @@ export function keyPackageRoutes(app: FastifyInstance, ctx: RelayContext): void 
           throw tooManyRequests('too many KeyPackage claims in the last hour');
         }
 
-        const claimed = await db.query<{ key_package: Buffer }>(
-          `UPDATE key_packages SET claimed_at = $3, claimed_by = $2, claim_approval_id = $4
-            WHERE id = (SELECT id FROM key_packages
-                         WHERE device_id = $1 AND claimed_at IS NULL AND expires_at > $3
-                         ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
-            RETURNING key_package`,
-          [targetId, caller.id, now, approvalId],
-        );
-        const row = claimed.rows[0];
+        // The device lock serializes one claimer. The unique index is the backstop
+        // if two claimers ever present the same (topic, approval).
+        await db.query('SAVEPOINT claim_kp');
+        let row: { key_package: Buffer } | undefined;
+        try {
+          const claimed = await db.query<{ key_package: Buffer }>(
+            `UPDATE key_packages SET claimed_at = $3, claimed_by = $2, claim_approval_id = $4, claim_topic_id = $5
+              WHERE id = (SELECT id FROM key_packages
+                           WHERE device_id = $1 AND claimed_at IS NULL AND expires_at > $3
+                           ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+              RETURNING key_package`,
+            [targetId, caller.id, now, approvalId, topicId],
+          );
+          row = claimed.rows[0];
+        } catch (err) {
+          if (uniqueViolation(err) !== 'key_packages_claim_topic_approval') throw err;
+          await db.query('ROLLBACK TO SAVEPOINT claim_kp');
+          const again = await db.query<{ key_package: Buffer }>(
+            'SELECT key_package FROM key_packages WHERE claim_topic_id = $1 AND claim_approval_id = $2',
+            [topicId, approvalId],
+          );
+          row = again.rows[0];
+        }
         if (!row) throw new RelayError(404, 'no_key_package', 'the device has no unclaimed KeyPackages; retry later');
         await db.query("INSERT INTO audit_log (account_id, device_id, topic_id, action) VALUES ($1, $2, $3, 'claim_kp')", [
           caller.accountId,
@@ -186,7 +206,7 @@ export function keyPackageRoutes(app: FastifyInstance, ctx: RelayContext): void 
       });
 
       if (result.remaining !== null && result.remaining < ctx.config.keyPackageLowWatermark) {
-        ctx.hub.publish([targetId], { type: 'key_packages_low', count: result.remaining });
+        await deliver(ctx, [targetId], { type: 'key_packages_low', count: result.remaining });
       }
       return { key_package: toBase64(result.keyPackage) };
     },

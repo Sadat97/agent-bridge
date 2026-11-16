@@ -5,6 +5,7 @@
 
 import type { RelayContext } from './context.ts';
 import { withTransaction } from './db.ts';
+import { deliver } from './deliver.ts';
 
 export interface RetentionResult {
   prunedTopics: number;
@@ -52,10 +53,11 @@ export async function runRetention(ctx: RelayContext): Promise<RetentionResult> 
         WHERE m.topic_id = $1 AND m.account_id = t.owner_account AND m.removed_at IS NULL`,
       [topicId],
     );
-    ctx.hub.publish(
-      rows.map((r) => r.device_id),
-      { type: 'member_stale', topic_id: topicId, device_id: deviceId },
-    );
+    await deliver(ctx, rows.map((r) => r.device_id), {
+      type: 'member_stale',
+      topic_id: topicId,
+      device_id: deviceId,
+    });
   }
 
   const welcomes = await ctx.pool.query(

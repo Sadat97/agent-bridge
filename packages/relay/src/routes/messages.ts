@@ -1,6 +1,7 @@
 // The relay's core: per-topic sequencing (DESIGN.md section 5.1).
 //
-// Every POST locks the topic row, so for each topic there is exactly one
+// Every POST locks the sender's device row (so the per-device post cap cannot
+// be raced) and then the topic row, so for each topic there is exactly one
 // writer at a time. A message is accepted only for the topic's current epoch,
 // a commit advances the epoch, and membership changes are verified and applied
 // in the same transaction that sequences the commit.
@@ -17,10 +18,11 @@ import {
   uuidToBytes,
   verifyWithLabel,
 } from '@agent-bridge/protocol';
-import { nowSeconds, requireDevice } from '../auth.ts';
+import { lockLiveDevice, nowSeconds, requireDevice } from '../auth.ts';
 import type { RelayContext } from '../context.ts';
 import { bytes, withTransaction } from '../db.ts';
-import { badRequest, conflict, forbidden, gone, notFound, RelayError } from '../errors.ts';
+import { deliver } from '../deliver.ts';
+import { badRequest, conflict, forbidden, gone, notFound, RelayError, tooManyRequests, unauthorized } from '../errors.ts';
 import { approvalIdSchema, base64Schema, decodeBase64Field, parseUuid, uuidSchema } from '../validate.ts';
 import { loadMembership } from './topics.ts';
 
@@ -186,8 +188,18 @@ export function messageRoutes(app: FastifyInstance, ctx: RelayContext): void {
         throw badRequest('welcome_mismatch', 'a commit with adds needs a Welcome addressed to exactly the added devices');
       }
 
-      // 3. Sequence, under the topic lock.
+      // 3. Sequence. Device lock first (rate limit), then the topic lock.
       const result = await withTransaction(ctx.pool, async (db) => {
+        if (!(await lockLiveDevice(db, device.id))) throw unauthorized('device unknown or revoked');
+        const since = new Date(ctx.now().getTime() - 60_000);
+        const recent = await db.query<{ n: number }>(
+          'SELECT count(*)::int AS n FROM mls_messages WHERE sender_device = $1 AND created_at > $2',
+          [device.id, since],
+        );
+        if (recent.rows[0]!.n >= ctx.config.postsPerMinute) {
+          throw tooManyRequests('too many posts in the last minute');
+        }
+
         const m = await loadMembership(db, topicId, device.id, { lockTopic: true });
         if (!m) throw notFound();
         if (m.closed_at) throw conflict('topic_closed', 'the topic is closed');
@@ -343,7 +355,7 @@ export function messageRoutes(app: FastifyInstance, ctx: RelayContext): void {
         return { seq, newEpoch, notify: [...notify, ...removedIds], welcomeIds };
       });
 
-      ctx.hub.publish(result.notify, {
+      await deliver(ctx, result.notify, {
         type: 'message',
         topic_id: topicId,
         seq: result.seq,
@@ -353,7 +365,7 @@ export function messageRoutes(app: FastifyInstance, ctx: RelayContext): void {
         ...(message.length <= ctx.config.wsInlineMaxBytes ? { message: toBase64(message) } : {}),
       });
       for (const w of result.welcomeIds) {
-        ctx.hub.publish([w.recipient], { type: 'welcome', id: w.id, topic_id: topicId, commit_seq: result.seq });
+        await deliver(ctx, [w.recipient], { type: 'welcome', id: w.id, topic_id: topicId, commit_seq: result.seq });
       }
       return reply.code(201).send({ seq: result.seq, epoch: result.newEpoch });
     },

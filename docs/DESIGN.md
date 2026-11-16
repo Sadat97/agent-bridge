@@ -518,6 +518,7 @@ erDiagram
     bytea key_package_ref UK
     bytea key_package
     uuid claimed_by FK
+    uuid claim_topic_id FK
     text claim_approval_id
   }
   auth_challenges {
@@ -566,7 +567,7 @@ erDiagram
 
 There is no `topic_state`, `invites`, or `refresh_tokens` table. Shared state exists only as ciphertext in `mls_messages` and as plaintext on bridges. Invite and removal *proposals* travel as encrypted application messages; the relay learns about a membership change only when the topic owner commits it.
 
-Added during implementation (milestone 2): `auth_challenges` (single-use login nonces), `topics.pruned_through_seq` (the retention watermark; a fetch cursor behind it gets 410), and `key_packages.claim_approval_id` (a retried claim returns the same KeyPackage). The schema of record is `packages/relay/migrations/`.
+Added during implementation (milestone 2): `auth_challenges` (single-use login nonces), `topics.pruned_through_seq` (the retention watermark; a fetch cursor behind it gets 410), and `key_packages.claim_topic_id` + `claim_approval_id` (a retried claim for the same topic and approval returns the same KeyPackage; `approval_id` is only unique per topic). The schema of record is `packages/relay/migrations/`.
 
 **Retention (decision 11.1):** `mls_messages` rows are deleted 30 days after `created_at`; unacked `welcomes` after 7 days. A member whose `last_fetched_seq` falls behind the oldest retained seq is marked `stale_at` (it would miss commits and can no longer follow the group) and the topic owner's bridge is notified to re-add it.
 
@@ -1417,8 +1418,8 @@ Access control is mandatory: only current, non-stale members can post or fetch a
 
 ### 8.4 Relay authentication
 
-- Challenge-response: the device signs `{relay origin, nonce}` with label `relay-auth`, then gets a 15-minute access token. No refresh tokens are stored.
-- TLS everywhere (Caddy). Rate limits per device on posts and KeyPackage claims.
+- Challenge-response: the device signs `{relay origin, nonce}` with label `relay-auth`, then gets a 15-minute access token. No refresh tokens are stored. A WebSocket opened with that token is closed when the token expires or the device is revoked; afterwards it receives nothing and its pings and acks are ignored.
+- TLS everywhere (Caddy). Rate limits per device on posts and KeyPackage claims. The relay defaults, which section 8.4 left unnumbered, are 60 posts per rolling minute and 30 KeyPackage claims per rolling hour.
 
 ### 8.5 Signature formats
 

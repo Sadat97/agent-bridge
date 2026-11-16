@@ -14,8 +14,10 @@ export interface RelayConfig {
   challengeTtlSeconds: number;
   /** Notify a device when its unclaimed KeyPackages drop below this. */
   keyPackageLowWatermark: number;
-  /** Per claiming device, per rolling hour. */
+  /** Per claiming device, per rolling hour. Design 8.4; the number is the relay default. */
   keyPackageClaimsPerHour: number;
+  /** Per sending device, per rolling minute. Design 8.4; the number is the relay default. */
+  postsPerMinute: number;
   /** Largest MLS message accepted, in bytes. */
   maxMessageBytes: number;
   /** Messages up to this size are pushed inline over WebSocket. */
@@ -31,6 +33,7 @@ export const defaults = {
   challengeTtlSeconds: 60,
   keyPackageLowWatermark: 10,
   keyPackageClaimsPerHour: 30,
+  postsPerMinute: 60,
   maxMessageBytes: 1024 * 1024,
   wsInlineMaxBytes: 64 * 1024,
   retentionIntervalMs: 60 * 60 * 1000,
