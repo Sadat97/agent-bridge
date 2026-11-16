@@ -43,6 +43,12 @@ export interface PrivateMessageHeader {
   groupId: Uint8Array;
   epoch: bigint;
   contentType: ContentTypeName;
+  /**
+   * Sent in the clear but bound into the AEAD: it is authentic only once the
+   * message has been decrypted successfully. For a commit it carries the
+   * membership approvals that bridges check (DESIGN.md section 5.8).
+   */
+  authenticatedData: Uint8Array;
 }
 
 export type MlsMessageHeader = PrivateMessageHeader | { wireFormat: Exclude<WireFormatName, 'private_message'> };
@@ -61,11 +67,11 @@ export function decodeMlsMessageHeader(message: Uint8Array): MlsMessageHeader {
   const epoch = r.u64();
   const contentType = contentTypeNames.get(r.u8());
   if (contentType === undefined) throw new DecodeError('unknown content type');
-  r.opaque(); // authenticated_data
+  const authenticatedData = r.opaque();
   r.opaque(); // encrypted_sender_data
   r.opaque(); // ciphertext
   r.end();
-  return { wireFormat, groupId, epoch, contentType };
+  return { wireFormat, groupId, epoch, contentType, authenticatedData };
 }
 
 export interface WelcomeSummary {

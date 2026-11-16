@@ -318,7 +318,58 @@ flowchart TB
 - **Approval surface:** `agb approvals …` and a minimal local web UI on `127.0.0.1:8788`. Agent tokens are not accepted there.
 - **Caddy** terminates TLS for the relay.
 
-**Trust boundary:** the bridge daemon and anything running as the same OS user with shell access can see plaintext. The relay, the network, and Postgres cannot. Approvals additionally require the identity passphrase from a human.
+### 3.1 Trust boundaries
+
+Where keys and plaintext live, and what crosses each boundary:
+
+```mermaid
+flowchart LR
+  subgraph machine["Person's machine: plaintext and keys"]
+    direction TB
+    Human(["Person<br/>holds the identity passphrase"])
+    Agent["Agent<br/>Claude Code, Cursor, script"]
+    Daemon["Bridge daemon<br/>MLS state, device key"]
+    Store[("store.sqlite<br/>plaintext messages and state<br/>wrapped keys")]
+    Human -->|"approvals, passphrase each time"| Daemon
+    Agent -->|"tool calls, scoped agent token"| Daemon
+    Daemon --- Store
+    Agent -.->|"shell access as the same OS user<br/>bypasses token scope (10.3)"| Store
+  end
+  subgraph vendor["LLM provider"]
+    Model["Model<br/>sees prompts and tool results"]
+  end
+  subgraph relayzone["Relay: untrusted for content"]
+    Relay["Relay and Postgres<br/>ciphertext, membership metadata"]
+  end
+  Agent <-->|"plaintext the agent reads"| Model
+  Daemon <-->|"TLS: MLS ciphertext and metadata"| Relay
+```
+
+- **Inside the person's machine** the bridge daemon, and anything running as the same OS user with shell access, can see plaintext. Agents are meant to reach topics only through their scoped token, but an agent with shell access can read the store directly. For the live test, run the bridge daemon as a separate OS user.
+- **The relay, the network, and Postgres** see only ciphertext and the metadata in section 10.1.
+- **The LLM provider** behind an agent (Anthropic for Claude Code, too) sees whatever that agent reads. E2EE protects against the relay, not the model provider.
+- **Approvals** additionally require the identity passphrase from a human.
+
+### 3.2 Code layout
+
+```mermaid
+flowchart TB
+  subgraph repo["Repository, npm workspaces"]
+    Protocol["packages/protocol<br/>TLS encoding, signature labels, device certs,<br/>MLS header decoder"]
+    Relay["packages/relay<br/>Fastify, Postgres, WebSocket"]
+    Bridge["packages/bridge, planned for milestones 3 to 5<br/>daemon, MCP, REST, agb CLI"]
+    Engine["MlsEngine interface (5.12)"]
+  end
+  TsMls["ts-mls 1.6.4<br/>MVP engine"]
+  OpenMls["OpenMLS 0.9.2 or later via WASM<br/>hardening gate"]
+  Relay --> Protocol
+  Bridge --> Protocol
+  Bridge --> Engine
+  Engine --> TsMls
+  Engine -.-> OpenMls
+```
+
+The relay depends only on `protocol` and never on an MLS library: it reads the unencrypted framing header with its own decoder. Only the bridge talks to an MLS engine, and only through `MlsEngine`.
 
 ---
 
@@ -433,6 +484,84 @@ CREATE TABLE audit_log (
   action           TEXT NOT NULL,                 -- 'register', 'commit', 'post', 'claim_kp', 'close', ...
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+```
+
+```mermaid
+erDiagram
+  accounts ||--o{ devices : "has"
+  accounts ||--o{ topics : "owns"
+  devices ||--o{ key_packages : "uploads"
+  devices ||--o{ auth_challenges : "logs in with"
+  topics ||--o{ topic_members : "has"
+  devices ||--o{ topic_members : "joins as"
+  topics ||--o{ mls_messages : "orders"
+  devices ||--o{ mls_messages : "sends"
+  topics ||--o{ welcomes : "creates"
+  devices ||--o{ welcomes : "receives"
+  topics ||--o{ membership_changes : "records"
+
+  accounts {
+    uuid id PK
+    text handle UK
+    bytea identity_pubkey
+  }
+  devices {
+    uuid id PK
+    uuid account_id FK
+    bytea signature_pubkey UK
+    bytea device_cert
+    timestamptz revoked_at
+  }
+  key_packages {
+    uuid id PK
+    uuid device_id FK
+    bytea key_package_ref UK
+    bytea key_package
+    uuid claimed_by FK
+    text claim_approval_id
+  }
+  auth_challenges {
+    bytea nonce PK
+    uuid device_id FK
+    timestamptz used_at
+  }
+  topics {
+    uuid id PK "equals the MLS group_id"
+    uuid owner_account FK
+    bigint current_epoch
+    bigint last_seq
+    bigint pruned_through_seq
+  }
+  topic_members {
+    uuid topic_id PK
+    uuid device_id PK
+    member_role role
+    bigint joined_seq
+    bigint last_fetched_seq
+    timestamptz stale_at
+    timestamptz removed_at
+  }
+  mls_messages {
+    uuid topic_id PK
+    bigint seq PK
+    bigint epoch
+    mls_content content
+    uuid sender_device FK
+    bytea message "opaque PrivateMessage"
+  }
+  welcomes {
+    uuid id PK
+    uuid recipient_device FK
+    bigint commit_seq
+    bytea welcome
+  }
+  membership_changes {
+    uuid topic_id PK
+    text approval_id PK
+    uuid device_id FK
+    membership_change change
+    bytea approval
+  }
 ```
 
 There is no `topic_state`, `invites`, or `refresh_tokens` table. Shared state exists only as ciphertext in `mls_messages` and as plaintext on bridges. Invite and removal *proposals* travel as encrypted application messages; the relay learns about a membership change only when the topic owner commits it.
@@ -559,6 +688,27 @@ On `POST /v1/topics/{id}/messages`, in one Postgres transaction with the topic r
 
 On `stale_epoch`, a bridge syncs (processing the winning commit), rebuilds its message in the new epoch, and retries. Because nothing is accepted for an old epoch, bridges never need to keep old epoch secrets, and a newcomer can read everything from its `joined_seq`.
 
+```mermaid
+sequenceDiagram
+  autonumber
+  participant A as Bridge A
+  participant R as Relay
+  participant B as Bridge B
+  Note over A,B: Both bridges are at epoch 4
+  A->>R: POST commit (epoch 4)
+  B->>R: POST commit (epoch 4)
+  Note over R: Topic row locked, so writers are serialized
+  R-->>A: 201 seq 120, epoch 5
+  R-->>B: 409 stale_epoch, current epoch 5
+  R--)B: WebSocket: message seq 120 (A's commit)
+  B->>B: Validate (5.8) and apply A's commit, now at epoch 5
+  B->>R: POST its message, rebuilt for epoch 5
+  R-->>B: 201 seq 121
+  R--)A: WebSocket: message seq 121
+```
+
+**What the relay can and cannot check.** The relay sees a commit's header, not its contents. Rule 5 checks only the membership changes the sender *declares* next to the commit. A commit that adds or removes someone without declaring it is sequenced like an ordinary key update; a relay test pins this behavior. The relay's checks are a backstop: they catch a buggy topic owner's bridge and keep the relay's membership metadata accurate. **The enforcement point is section 5.8, on every bridge.**
+
 ### 5.2 Message envelope
 
 Every application message decrypts to:
@@ -624,12 +774,42 @@ Maximum request body at the relay: 1 MB. Larger documents or attachments are out
 
 1. The topic owner's bridge claims one of the invitee device's KeyPackages (`POST /v1/devices/{device_id}/key-packages/claim`, presenting the approval). If none is available, the approval stays `approved` and is retried on each sync until it expires (7 days).
 2. It validates the KeyPackage: credential certificate chains to the approved identity key; leaf signature key equals the approved device key.
-3. It creates the Add commit with the approval in the commit's `authenticated_data`, plus a Welcome.
+3. It creates the Add commit with a `CommitApprovals` structure (section 5.8) in the commit's `authenticated_data`, plus a Welcome.
 4. It posts the commit with its membership delta and Welcome. On `stale_epoch`, it syncs and rebuilds.
 5. It immediately posts a `state_snapshot` (`reason: join`) in the new epoch.
 6. Other members' bridges verify the commit (section 5.8) and record the `approval_id` as consumed.
 7. The invitee's bridge receives the Welcome from its inbox, joins, reads from `commit_seq`, loads the snapshot, and sets the topic to `pending_join`. The topic is hidden from agents and a `join` approval appears: "mohamed added you to 'Zurich trip'". Accept → `active`. Decline → the bridge posts `leave` and the topic owner's bridge removes it.
 8. If no snapshot arrives (the topic owner went offline between commit and snapshot), the newcomer posts `snapshot_request`; the topic owner's bridge answers when it is next online. In MVP a newcomer trusts only the topic owner's snapshot.
+
+The whole invite-to-join flow (sections 5.5 and 5.6):
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor P as Topic owner
+  participant OB as Topic owner's bridge
+  participant R as Relay
+  participant MB as Other member's bridge
+  participant IB as Invitee's bridge
+  actor I as Invitee
+  IB->>R: Upload KeyPackages (any time earlier)
+  OB->>P: Invite approval: handle, fingerprint, verified or not
+  P->>OB: Approve with passphrase
+  OB->>OB: Sign add approval with identity key
+  OB->>R: Claim a KeyPackage, presenting the approval
+  R-->>OB: KeyPackage
+  OB->>OB: Check credential (8.2), build Add commit and Welcome
+  OB->>R: POST commit, declared adds, Welcome
+  R->>R: Check epoch, owner, approval signatures, then assign seq
+  R--)MB: Commit
+  R--)IB: Welcome event
+  MB->>MB: Validate commit (5.8), then apply
+  OB->>R: state_snapshot for the new member
+  IB->>R: Fetch inbox, join from Welcome
+  IB->>R: Fetch from commit_seq, load the snapshot
+  IB->>I: Join approval: added to a topic by its owner
+  I->>IB: Accept, topic becomes active
+```
 
 ### 5.7 Remove, leave, rotate, close
 
@@ -639,15 +819,106 @@ Maximum request body at the relay: 1 MB. Larger documents or attachments are out
 - **Key rotation:** each bridge commits a self-Update if it has not committed in 7 days, and after any suspected compromise.
 - **Stale member re-add:** when the relay reports a member as stale, the topic owner gets a `remove` + `invite` approval pair to re-add that person, who then receives a fresh snapshot.
 
+A topic's status on a bridge (`topics.status` in section 4.2):
+
+```mermaid
+stateDiagram-v2
+  [*] --> active: created by the topic owner
+  [*] --> pending_join: joined from a Welcome
+  pending_join --> active: person accepts
+  pending_join --> left: person declines and posts leave
+  active --> left: removed, or own leave committed
+  active --> stale: fell behind 30-day retention
+  stale --> pending_join: topic owner re-adds
+  active --> halted: a commit fails validation (5.8)
+  active --> closed: topic owner closes
+  halted --> [*]
+  left --> [*]
+  closed --> [*]
+```
+
 ### 5.8 Commit validation (every bridge)
 
-A commit is accepted by a bridge only if:
+**This is the only defense against unapproved members.** Commits are encrypted, so the relay cannot see who a commit adds or removes (section 5.1). Every bridge must decrypt each commit and check it before applying it. Do not skip or weaken this on the grounds that the relay already checks; the relay checks only what the sender declares.
 
-- it contains no Add or Remove, **or** its committer leaf belongs to the topic owner's identity key; and
-- every Add carries a valid, unused `add` approval in `authenticated_data` for exactly that device key and identity key; every Remove carries a valid `remove` approval or cites a `leave` message from the removed member; and
-- every new leaf's credential passes section 8.2.
+**Rules.** A bridge accepts a commit only if all of these hold:
 
-A commit that passes MLS checks but fails policy cannot be "rejected" without forking. The bridge sets the topic to `halted`, stops exposing it to agents, and alerts its person. This only happens if the topic owner's bridge is compromised or buggy.
+1. Every proposal is an Add, Remove, or Update. PSK, ReInit, ExternalInit, GroupContextExtensions, and custom proposals are rejected in MVP.
+2. If the commit contains any Add or Remove, the committer's leaf belongs to the topic owner (its credential carries the topic owner's pinned identity key) and no Remove targets the topic owner.
+3. The commit's `authenticated_data` decodes as `CommitApprovals` (below), and its entries match the commit's Adds and Removes **one to one**, with nothing missing and nothing extra:
+   - each Add has an `add` entry whose device key equals the new leaf's signature key, and whose signature verifies under the topic owner's identity key over the `add` content (section 8.5), using the invitee identity key from the new leaf's credential;
+   - each Remove has a `remove` entry whose signature verifies over the `remove` content for the removed leaf's device key, or a `leave` entry whose `leave_seq` is a `leave` message this bridge processed from that same member;
+   - no `approval_id` was used before in this topic (`consumed_membership_approvals`).
+4. Every new leaf's credential passes section 8.2: the device certificate verifies under the identity key, the certified key equals the leaf's signature key, and the identity key matches the pinned contact for that handle.
+
+Bridges do not re-check `expires_at`: the topic owner's bridge checks it before committing and the relay checks it when sequencing, and other bridges may process the commit days later.
+
+**`CommitApprovals`** (TLS presentation language, as in section 8.5). A commit with no Adds or Removes carries empty `authenticated_data`.
+
+```
+struct {
+  opaque approval_id<V>;
+  opaque device_key<V>;        // the added leaf's signature key
+  uint64 expires_at;
+  opaque signature<V>;         // topic owner identity key, label "add"
+} AddApprovalEntry;
+
+struct {
+  opaque approval_id<V>;
+  opaque device_key<V>;        // the removed leaf's signature key
+  uint8  kind;                 // 1 = remove, 2 = leave
+  select (kind) {
+    case 1: opaque signature<V>;   // topic owner identity key, label "remove"
+    case 2: uint64 leave_seq;      // relay seq of the member's own leave message
+  };
+} RemoveApprovalEntry;
+
+struct {
+  uint8 version = 1;
+  AddApprovalEntry adds<V>;
+  RemoveApprovalEntry removes<V>;
+} CommitApprovals;
+```
+
+**Implementation (milestone 3).** Validation runs inside ts-mls, before the commit is applied: `processPrivateMessage(state, message, pskIndex, cs, callback)` calls `callback({ kind: "commit", senderLeafIndex, proposals })` after decrypting and before applying; returning `"reject"` leaves the group state unchanged. The callback does not receive `authenticated_data`, so the bridge reads it from the message header (`decodeMlsMessageHeader` in `packages/protocol`) and passes it into the callback. This is safe: in a PrivateMessage the authenticated data is bound into the encryption, so once decryption succeeds it is authentic. The callback must be synchronous; Ed25519 verification in `packages/protocol` is. `MlsEngine.process` (section 5.12) wraps all of this, so callers cannot apply a commit without validation.
+
+**On rejection.** A commit that MLS accepts but policy rejects cannot be skipped without forking the group. The bridge:
+
+- keeps its pre-commit state and records the topic as `halted` at that seq, in one transaction;
+- **sends nothing more in the topic**: no messages, no commits. Anything sent after accepting that commit would be readable by an unapproved member;
+- hides the topic from agents and alerts its person.
+
+If ts-mls throws while processing a commit (decryption or MLS validation failure), the bridge halts the same way, because a commit cannot be skipped. Recovery is a new topic created by the topic owner without the offending member. A malicious member can therefore force a halt (denial of service) but cannot add or remove anyone.
+
+```mermaid
+flowchart TD
+  In["Next commit in seq order"] --> Proc["MlsEngine.process: ts-mls decrypts,<br/>then calls the validation callback"]
+  Proc -->|"decryption or MLS check fails"| Halt
+  Proc -->|decrypted| R1{"Only Add, Remove, Update proposals?"}
+  R1 -->|no| Halt
+  R1 -->|yes| R2{"Any Add or Remove?"}
+  R2 -->|"no: key update"| Accept
+  R2 -->|yes| R3{"Committer is the topic owner,<br/>and the owner is not removed?"}
+  R3 -->|no| Halt
+  R3 -->|yes| R4{"authenticated_data approvals match<br/>the Adds and Removes one to one,<br/>signatures valid, ids unused?"}
+  R4 -->|no| Halt
+  R4 -->|yes| R5{"Every new leaf passes<br/>credential checks (8.2)?"}
+  R5 -->|no| Halt
+  R5 -->|yes| Accept["Accept: apply, persist state and seq<br/>in one transaction, record approval ids"]
+  Halt["Reject: keep old state, mark topic halted,<br/>send nothing more, hide from agents, alert the person"]
+```
+
+**Required tests (milestone 3)**, each with real MLS through ts-mls:
+
+- a member who is not the topic owner commits a hidden Add with empty `authenticated_data`: every other bridge halts, and the planted member never receives anything sent after the commit;
+- the topic owner's approvals cover Bob but the commit adds Eve;
+- an approval entry with no matching proposal, and a proposal with no matching entry;
+- a replayed `approval_id`;
+- a forged or wrong-key approval signature;
+- a `leave` entry pointing at another member's message;
+- an unsupported proposal type (PSK, GroupContextExtensions);
+- a new leaf whose device certificate does not chain to the pinned identity key;
+- a halted topic stays halted after a restart, and the bridge sends nothing in it.
 
 ### 5.9 Post a message
 
@@ -687,11 +958,16 @@ interface MlsEngine {
     authenticatedData: Uint8Array;  // approvals (5.8)
   }): Promise<{ commit: Uint8Array; welcome?: Uint8Array; pending: GroupState }>;
   encrypt(state: GroupState, plaintext: Uint8Array): Promise<{ message: Uint8Array; next: GroupState }>;
-  process(state: GroupState, message: Uint8Array): Promise<
+  // `validateCommit` is required: it runs after decryption and before a commit
+  // is applied (section 5.8). Returning false yields `rejected` with the state unchanged.
+  process(state: GroupState, message: Uint8Array, validateCommit: (commit: {
+    committer: Member;
+    proposals: ProposalSummary[];   // kind, plus the added or removed leaf
+    authenticatedData: Uint8Array;  // CommitApprovals
+  }) => boolean): Promise<
     | { kind: 'application'; sender: Member; plaintext: Uint8Array; next: GroupState }
-    | { kind: 'commit'; committer: Member; added: Member[]; removed: Member[];
-        authenticatedData: Uint8Array; next: GroupState }>;
-  decodeFraming(message: Uint8Array): { groupId: Uint8Array; epoch: bigint; contentType: 'application' | 'proposal' | 'commit' };
+    | { kind: 'commit'; committer: Member; added: Member[]; removed: Member[]; next: GroupState }
+    | { kind: 'rejected'; reason: string }>;
   members(state: GroupState): Member[];
   epoch(state: GroupState): bigint;
   serialize(state: GroupState): Uint8Array;
@@ -699,7 +975,7 @@ interface MlsEngine {
 }
 ```
 
-The relay uses only `decodeFraming`.
+The relay does not use `MlsEngine`. It reads the framing header with `decodeMlsMessageHeader` from `packages/protocol`, which the bridge also uses to get a commit's `authenticated_data`.
 
 ---
 
@@ -722,6 +998,28 @@ All three agent interfaces (MCP, REST, CLI) call the same handlers with the same
 ```
 
 A `request` message whose `payload.kind` is in `requests_needing_approval` always waits for approval.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Ag as Agent
+  participant BA as Author's bridge
+  actor P as Person
+  participant R as Relay
+  participant BB as Other member's bridge
+  participant Ag2 as Other member's agent
+  Ag->>BA: post_message, type request, payload.kind spend
+  BA->>BA: Policy file says approval is needed
+  BA-->>Ag: pending_approval with approval_id
+  Note over Ag,BA: No agent tool can approve. The agent can only poll list_approvals.
+  P->>BA: agb approvals approve, passphrase typed at a TTY
+  BA->>BA: Sign the request with the identity key, encrypt
+  BA->>R: POST application message
+  R--)BB: message
+  BB->>BB: Decrypt, verify the request signature
+  Ag2->>BB: read_messages
+  BB-->>Ag2: The request, with approval signed
+```
 
 Errors use one shape: `{ "error": "not_found | unauthorized | out_of_scope | invalid_patch | topic_halted | topic_pending_join | mls_error | relay_unavailable", "message": "…", "details": {} }`. `conflict` and `pending_approval` are normal results, not errors.
 
@@ -1175,7 +1473,7 @@ Exact encoding (implemented in `packages/protocol/src/signatures.ts`): the signe
 
 1. **Contract freeze** — this document. Done 16 November 2026.
 2. **Relay skeleton** — schema, device challenge auth, sequencing rules with framing decode, per-topic seq, Welcome inbox, WebSocket, retention job.
-3. **`MlsEngine` + ts-mls** — create/add/remove/update/encrypt/decrypt; credential validation (8.2); commit validation (5.8); state serialization round-trip; crash-safety tests.
+3. **`MlsEngine` + ts-mls** — create/add/remove/update/encrypt/decrypt; credential validation (8.2); state serialization round-trip; crash-safety tests. **Must-have: bridge-side commit validation (5.8)**, including the `CommitApprovals` codec in `packages/protocol`, validation inside the ts-mls commit callback, halt-and-stop-sending on rejection, and every test listed in section 5.8. The relay cannot see commit contents, so this is the only defense against unapproved members; it must not be deferred because the relay checks declared changes.
 4. **Bridge daemon + agent surface** — MCP/REST/CLI, tokens, policy, state compare-and-swap. Integration tests with two bridges on a local relay, including **concurrent commits** and **concurrent patches**.
 5. **Human surface** — `agb approvals` with TTY passphrase, local approval UI, contacts and fingerprints.
 6. **Deploy and live test** — relay on Hostinger behind Caddy; Mohamed and a friend run the trip-planning test with local Claude agents.
@@ -1209,19 +1507,19 @@ This is comparable to any unsealed-sender group messenger. Hiding membership and
 | Honest-but-curious relay | Observe metadata | Read or forge content; add or remove members |
 | Malicious relay | Drop, delay, or withhold messages and Welcomes; refuse service; show different orders to different members (detected as an MLS fork or a state-hash mismatch, resulting in denial of service, not disclosure); **substitute a handle's identity key at first contact** | Decrypt; forge signatures; commit into a group; get a key substitution past a verified contact |
 | Network eavesdropper | See that bridges talk to the relay | Read TLS or MLS payloads |
-| Malicious member | Read everything from their join epoch on; post misleading content or prompt injections; propose invites and removals | Add or remove members; forge another member's authorship; read epochs before joining or after removal |
+| Malicious member | Read everything from their join epoch on; post misleading content or prompt injections; propose invites and removals; send a commit with hidden Adds or Removes, which the relay accepts, forcing every honest bridge to halt the topic (denial of service) | Add or remove members (every bridge enforces section 5.8); forge another member's authorship; read epochs before joining or after removal |
 | Prompt-injected agent | Anything its token allows: read in-scope topics, post, propose state changes, invites, removals | Approve anything; publish sensitive requests or state changes without approval; see topics outside its scope |
 | Local process with shell access as the same OS user (including a coding agent) | Read the SQLite store, call the daemon, capture the passphrase by keylogging or reading memory | — run untrusted agents as a separate OS user or in a sandbox |
 | Removed member | Keep what they already decrypted | Decrypt epochs after the Remove commit |
 | New member | Current state (snapshot) and new messages | Old-epoch messages |
 | Compromised bridge machine | Device key: read and post as that person in their topics; identity key only if the passphrase is captured | Other people's topics |
-| Hosted LLM vendor (post-MVP) | Any tool result the agent fetched | Relay ciphertext; topics outside that agent's token scope |
+| LLM provider behind any agent (Anthropic for Claude Code in the MVP; hosted agents later) | Any tool result the agent fetched | Relay ciphertext; topics outside that agent's token scope (unless the agent has shell access, see above) |
 | Compromised relay host | Relay database and metadata | Keys or plaintext — no bridge runs on the relay host |
 
 ### 10.4 Mitigations in the design
 
 - MLS for all messages; relay-enforced single commit per epoch; member removal; weekly self-Updates.
-- Membership changes need the topic owner's identity-key approval, committed only by the topic owner's bridge, verified by every member and by the relay; approvals are single-use.
+- Membership changes need the topic owner's identity-key approval and are committed only by the topic owner's bridge. Every bridge enforces this by checking each decrypted commit (5.8); the relay checks only the declared changes, as a backstop. Approvals are single-use.
 - Identity-signed device certificates in credentials; TOFU pinning; out-of-band fingerprint verification.
 - Approvals are human-only (passphrase), absent from the agent surface; policy is the person's config, not agent input.
 - Signed requests and approved state changes, so other agents can tell endorsed actions from unendorsed ones.
@@ -1237,6 +1535,7 @@ This is comparable to any unsealed-sender group messenger. Hiding membership and
 - **Unaudited ts-mls** until the hardening gate.
 - **Trust on first use:** an unverified contact can be a relay key substitution.
 - **Topic owner is a single point** for membership changes; while their bridge is offline, nobody can be added or removed.
+- **Forced halt:** a malicious or compromised member can send a commit with hidden membership changes. Honest bridges reject it and halt the topic, so the topic is lost: denial of service, not disclosure. Recovery is a new topic without that member.
 - **Retention:** a member offline for more than 30 days must be re-added and receives only current state.
 - **KeyPackage draining:** a hostile account can claim KeyPackages to delay adds; rate limits and automatic top-up reduce it.
 - **Laptop-hosted bridges** are offline while the laptop sleeps; delivery is async, so this only delays things.

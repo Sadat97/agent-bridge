@@ -149,7 +149,12 @@ describe('MLS framing against ts-mls', async () => {
     const { privateMessage } = await createApplicationMessage(group, utf8('hello'), impl);
     const encoded = encodeMlsMessage({ privateMessage, wireformat: 'mls_private_message', version: 'mls10' });
     const header = decodeMlsMessageHeader(encoded);
-    expect(header).toMatchObject({ wireFormat: 'private_message', epoch: 0n, contentType: 'application' });
+    expect(header).toMatchObject({
+      wireFormat: 'private_message',
+      epoch: 0n,
+      contentType: 'application',
+      authenticatedData: new Uint8Array(),
+    });
     if (header.wireFormat !== 'private_message') throw new Error('unreachable');
     expect(bytesToUuid(header.groupId)).toBe(topicId);
     expect(() => decodeMlsMessageHeader(encoded.subarray(0, encoded.length - 1))).toThrow(DecodeError);
@@ -162,7 +167,12 @@ describe('MLS framing against ts-mls', async () => {
       { extraProposals: [add], ratchetTreeExtension: true, authenticatedData: utf8('approvals') },
     );
     const commit = encodeMlsMessage(result.commit);
-    expect(decodeMlsMessageHeader(commit)).toMatchObject({ wireFormat: 'private_message', epoch: 0n, contentType: 'commit' });
+    expect(decodeMlsMessageHeader(commit)).toMatchObject({
+      wireFormat: 'private_message',
+      epoch: 0n,
+      contentType: 'commit',
+      authenticatedData: utf8('approvals'),
+    });
 
     const welcome = encodeMlsMessage({ welcome: result.welcome!, wireformat: 'mls_welcome', version: 'mls10' });
     expect(decodeMlsMessageHeader(welcome)).toEqual({ wireFormat: 'welcome' });

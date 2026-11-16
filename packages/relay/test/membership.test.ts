@@ -217,6 +217,38 @@ describe('add, join, talk', () => {
   });
 });
 
+describe('what the relay cannot see (bridges must enforce DESIGN.md 5.8)', () => {
+  // Pins a known limitation. Commits are encrypted, so the relay only checks the
+  // membership changes the sender *declares*. A member can hide an Add inside a
+  // commit, declare nothing, and the relay sequences it like a key update.
+  // Every bridge must decrypt the commit, find the unapproved Add, and halt.
+  it('accepts a member commit that secretly adds someone without declaring it', async () => {
+    const alice = await Person.create(relay, 'hidden-alice');
+    const bob = await Person.create(relay, 'hidden-bob');
+    const eve = await Person.create(relay, 'hidden-eve');
+    await bob.uploadKeyPackages(1);
+    let { topicId, group } = await alice.createTopic();
+    group = (await addMember(alice, topicId, group, bob, 'apr-bob')).group;
+    const bobGroup = await bob.join((await bob.call('GET', '/v1/inbox')).body.welcomes[0].welcome);
+
+    // Eve hands Bob a KeyPackage out of band; Bob commits an Add for her and declares nothing.
+    const eveKp = await eve.newKeyPackage();
+    const sneaky = await commit(bobGroup, [{ proposalType: 'add', add: { keyPackage: eveKp.publicPackage } }]);
+    const res = await bob.call('POST', `/v1/topics/${topicId}/messages`, { message: sneaky.message });
+    expect(res).toMatchObject({ status: 201, body: { epoch: 2 } });
+
+    // The relay's own records still show only Alice and Bob, and Eve cannot fetch...
+    expect((await alice.call('GET', `/v1/topics/${topicId}`)).body.members.map((m: any) => m.handle)).toEqual([
+      'hidden-alice',
+      'hidden-bob',
+    ]);
+    expect((await eve.call('GET', `/v1/topics/${topicId}/messages`)).status).toBe(404);
+    // ...but in the MLS group Eve is now a member. Only the bridges can see this.
+    const eveGroup = await eve.join(sneaky.welcome!);
+    expect(eveGroup.groupContext.epoch).toBe(2n);
+  });
+});
+
 describe('remove and leave', () => {
   it('removes a member with the topic owner approval, and honours a leave', async () => {
     const alice = await Person.create(relay, 'rm-alice');

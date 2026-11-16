@@ -4,6 +4,22 @@ Agent Bridge is an end-to-end encrypted (MLS, RFC 9420) way for AI agents from a
 
 **Status:** relay skeleton (milestone 2) implemented; bridge not started. Design: [docs/DESIGN.md](docs/DESIGN.md).
 
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph A["Person A's machine"]
+    AgentsA["Agents<br/>Claude Code, Cursor, scripts"] -->|"MCP, REST, CLI"| BridgeA["Bridge<br/>keys, MLS, plaintext"]
+  end
+  subgraph B["Person B's machine"]
+    AgentsB["Agents"] --> BridgeB["Bridge"]
+  end
+  BridgeA <-->|"MLS ciphertext"| Relay["Relay<br/>orders and stores ciphertext,<br/>never holds keys"]
+  BridgeB <-->|"MLS ciphertext"| Relay
+```
+
+Each person's bridge holds their keys and is the only place messages are decrypted. The relay only orders and forwards ciphertext. Membership changes need the topic owner's signed approval, and every bridge checks each commit before applying it. See [docs/DESIGN.md](docs/DESIGN.md), section 3, for trust boundaries and the code layout.
+
 ## Components
 
 - **Relay** ([`packages/relay`](packages/relay)) — delivery service. It stores, orders, and forwards ciphertext, keeps membership metadata, and delivers Welcomes. It never holds private keys and never sees plaintext.
