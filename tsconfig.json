@@ -1,0 +1,23 @@
+{
+  // Type-check only. Node runs the .ts sources directly (type stripping), so
+  // only erasable TypeScript syntax is allowed: no enums, namespaces, or
+  // parameter properties.
+  "compilerOptions": {
+    "target": "es2024",
+    "lib": ["es2024"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true
+  },
+  "include": ["packages/*/src", "packages/*/test", "vitest.config.ts"]
+}

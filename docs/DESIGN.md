@@ -437,6 +437,8 @@ CREATE TABLE audit_log (
 
 There is no `topic_state`, `invites`, or `refresh_tokens` table. Shared state exists only as ciphertext in `mls_messages` and as plaintext on bridges. Invite and removal *proposals* travel as encrypted application messages; the relay learns about a membership change only when the topic owner commits it.
 
+Added during implementation (milestone 2): `auth_challenges` (single-use login nonces), `topics.pruned_through_seq` (the retention watermark; a fetch cursor behind it gets 410), and `key_packages.claim_approval_id` (a retried claim returns the same KeyPackage). The schema of record is `packages/relay/migrations/`.
+
 **Retention (decision 11.1):** `mls_messages` rows are deleted 30 days after `created_at`; unacked `welcomes` after 7 days. A member whose `last_fetched_seq` falls behind the oldest retained seq is marked `stale_at` (it would miss commits and can no longer follow the group) and the topic owner's bridge is notified to re-add it.
 
 ### 4.2 Bridge local store (SQLite, per person)
@@ -605,7 +607,7 @@ Maximum request body at the relay: 1 MB. Larger documents or attachments are out
 
 ### 5.4 Create topic
 
-1. `topic_id` = random UUID, used as the MLS `group_id`. `createGroup` with suite 1; Welcomes include the `ratchet_tree` extension so the relay never serves trees.
+1. `topic_id` = random UUID; its 16 raw bytes are the MLS `group_id` (the relay rejects messages whose `group_id` does not match the topic). `createGroup` with suite 1; Welcomes include the `ratchet_tree` extension so the relay never serves trees.
 2. `POST /v1/topics {id}`. The relay records the caller's account as topic owner, epoch 0, and the caller's device as the `owner` member.
 3. Post a `state_snapshot` at version 0 containing `/_meta` (`slug`, `title`) and the initial document.
 
@@ -1048,7 +1050,7 @@ Public origin: `https://relay.<domain>` (hostname open, section 11.2). Bodies ar
 | POST | `/v1/auth/token` | `{ device_id, nonce, signature }` → 15-minute access token |
 | POST | `/v1/key-packages` | Upload KeyPackages |
 | GET | `/v1/key-packages/count` | Caller's unclaimed count |
-| POST | `/v1/devices/{device_id}/key-packages/claim` | Atomically claim one; body carries the `add` approval; rate-limited per claimer |
+| POST | `/v1/devices/{device_id}/key-packages/claim` | Atomically claim one. Body `{ topic_id, approval_id, expires_at, approval }` is the `add` approval; a retry with the same approval returns the same KeyPackage; rate-limited per claimer |
 | POST | `/v1/topics` | Create topic `{ id }`; caller becomes topic owner |
 | GET | `/v1/topics` | Caller's topics: ids, epoch, last seq, members (no bodies) |
 | GET | `/v1/topics/{id}` | Topic metadata and membership |
@@ -1066,23 +1068,27 @@ Public origin: `https://relay.<domain>` (hostname open, section 11.2). Bodies ar
 {
   "message": "<base64 MLSMessage>",
   "membership": {
-    "adds":    [{ "device_id": "…", "approval_id": "…", "approval": "<base64>" }],
-    "removes": [{ "device_id": "…", "approval_id": "…", "approval": "<base64>", "leave_seq": null }]
+    "adds":    [{ "device_id": "…", "approval_id": "…", "expires_at": 1763900000, "approval": "<base64>" }],
+    "removes": [{ "device_id": "…", "approval_id": "…", "approval": "<base64>" }]
   },
   "welcome": { "message": "<base64 Welcome>", "recipients": ["<device_id>"] }
 }
 ```
 
-`membership` and `welcome` are only allowed with a commit. Response: `{ "seq": 4812, "epoch": 13 }`, or **409** `{ "error": "stale_epoch", "current_epoch": 13 }`.
+Each remove carries exactly one of `approval` (a `remove` signature) or `leave_seq` (the seq of the member's own `leave` message). `membership` and `welcome` are only allowed with a commit, and a commit with adds must carry a Welcome addressed to exactly the added devices.
 
-WebSocket events (server to client):
+Response: `{ "seq": 4812, "epoch": 13 }`, where `epoch` is the topic's epoch after this message (a commit returns the new epoch). On a race: **409** `{ "error": "stale_epoch", "message": "…", "details": { "current_epoch": 13 } }`. All relay errors use the `{ error, message, details? }` shape.
+
+WebSocket events (server to client). `epoch` is the epoch the message was sent in. Devices added by a commit get its Welcome, not the commit:
 
 ```json
-{ "type": "message", "topic_id": "…", "seq": 4812, "epoch": 13, "content": "application", "message": "<base64, inline up to 64 KB>" }
-{ "type": "welcome", "id": "…", "topic_id": "…" }
+{ "type": "message", "topic_id": "…", "seq": 4812, "epoch": 13, "content": "application", "sender_device": "…", "message": "<base64, inline up to 64 KB>" }
+{ "type": "welcome", "id": "…", "topic_id": "…", "commit_seq": 4811 }
 { "type": "member_stale", "topic_id": "…", "device_id": "…" }
 { "type": "key_packages_low", "count": 4 }
 ```
+
+Client to server: `{ "type": "ack", "topic_id": "…", "seq": 4812 }` after persisting messages up to `seq` (advances the fetch cursor that retention uses to detect stale members), and `{ "type": "ping" }`, answered with `{ "type": "pong" }`. Messages on one socket are handled in order. A `GET …/messages` fetch also advances the cursor, and a sender that was caught up counts as having its own message.
 
 Access control is mandatory: only current, non-stale members can post or fetch a topic's messages; Welcomes go only to their recipient device. This is access control, not confidentiality.
 
@@ -1119,6 +1125,8 @@ Access control is mandatory: only current, non-stale members can post or fetch a
 ### 8.5 Signature formats
 
 Every signature is `Ed25519.Sign(key, "agent-bridge/v1/<label>" ‖ content)`, where `content` is a length-prefixed encoding (TLS presentation language, as in MLS) — never ad-hoc string concatenation.
+
+Exact encoding (implemented in `packages/protocol/src/signatures.ts`): the signed bytes are `struct { opaque label<V>; opaque content<V>; }`, mirroring MLS `SignWithLabel`, with MLS variable-length integers for vector lengths. Inside `content`, UUIDs are `opaque<V>` of their 16 raw bytes, strings are UTF-8 `opaque<V>`, keys and hashes are `opaque<V>`, times are `uint64` Unix seconds, and `role` is `uint8` (member = 1, owner = 2). A device certificate is self-contained: the `device-cert` fields followed by `opaque signature<V>`.
 
 | Label | Signed by | Content |
 | --- | --- | --- |

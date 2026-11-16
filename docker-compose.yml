@@ -1,0 +1,41 @@
+# Local development and tests. Production (Caddy, domain) comes with milestone 6.
+#
+#   npm run db:up                 start Postgres on 127.0.0.1:54329
+#   docker compose up -d relay    also run the relay on 127.0.0.1:8080
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: agent_bridge
+      POSTGRES_PASSWORD: agent_bridge
+      POSTGRES_DB: agent_bridge
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_bridge -d agent_bridge"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  relay:
+    build:
+      context: .
+      dockerfile: packages/relay/Dockerfile
+    profiles: ["relay"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://agent_bridge:agent_bridge@postgres:5432/agent_bridge
+      RELAY_ORIGIN: http://127.0.0.1:8080
+      RELAY_TOKEN_SECRET: dev-only-secret-change-me-dev-only-secret
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  pgdata:

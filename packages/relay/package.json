@@ -1,0 +1,27 @@
+{
+  "name": "agent-bridge-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Bridge relay: the MLS Delivery Service. Stores, orders and forwards ciphertext; never holds keys.",
+  "exports": {
+    ".": "./src/app.ts"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts",
+    "migrate": "node src/migrate-cli.ts"
+  },
+  "dependencies": {
+    "@agent-bridge/protocol": "0.1.0",
+    "@fastify/websocket": "11.3.7",
+    "fastify": "5.12.8",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "@types/ws": "8.18.2",
+    "ts-mls": "1.6.4",
+    "ws": "8.23.0"
+  }
+}
