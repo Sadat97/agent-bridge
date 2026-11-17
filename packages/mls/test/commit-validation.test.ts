@@ -2,8 +2,10 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   addApprovalContent,
+  bytesEqual,
   encodeBridgeCredential,
   encodeCommitApprovals,
+  generateEd25519KeyPair,
   issueDeviceCert,
   SignatureLabel,
   signWithLabel,
@@ -11,7 +13,7 @@ import {
 } from '@agent-bridge/protocol';
 import { createCommit, defaultCapabilities, defaultLifetime, encodeMlsMessage, generateKeyPackage, getCiphersuiteFromName, getCiphersuiteImpl } from 'ts-mls';
 import { debugClientState } from '../src/ts-mls-engine.ts';
-import { evaluateCommit, replenishKeyPackages } from '../src/index.ts';
+import { createTsMlsEngine, encodeEnvelope, replenishKeyPackages } from '../src/index.ts';
 import { rawCommit } from './attack.ts';
 import { connected, later, makePerson, reopen, signAdd, signRemove } from './helpers.ts';
 
@@ -299,32 +301,96 @@ describe('commit validation', () => {
     expect(session3.get(bob3)!.haltReason).toMatch(/credential/i);
   });
 
-  it('rejects a commit that would remove the topic owner', () => {
-    const alice = makePerson('alice');
-    const ownerKey = alice.identity.publicKey;
-    const member = {
-      leafIndex: 0,
-      signatureKey: alice.device.publicKey,
-      credential: alice.credential,
-    };
-    const decision = evaluateCommit(
-      {
-        committer: member,
-        proposals: [{ kind: 'remove', removed: member }],
-        authenticatedData: encodeCommitApprovals({
-          adds: [],
-          removes: [{ kind: 'leave', approvalId: 'apr-owner', deviceKey: alice.device.publicKey, leaveSeq: 1 }],
-        }),
-      },
-      {
-        topicId: randomUUID(),
-        ownerIdentityKey: ownerKey,
-        consumedApprovalIds: new Set(),
-        messages: new Map([[1, { signatureKey: alice.device.publicKey, type: 'leave', authorMatches: true }]]),
-        pinnedIdentity: () => ownerKey,
-      },
+  it('halts when a commit removes a leaf that carries the topic owner identity', async () => {
+    const carol = makePerson('carol');
+    const { alice, topicId, owner, board, session } = await connected([carol]);
+    const carolSession = session.get(carol)!;
+    // MLS rejects a commit that removes the committer, so the owner's own leaf
+    // never becomes a ciphertext. A second leaf certified by the owner's identity
+    // key is a real Remove, and section 5.8 still refuses it.
+    await expect(owner.engine.commit(owner.confirmedState(), { removes: [0], authenticatedData: new Uint8Array() })).rejects.toThrow(/removing committer/);
+
+    const device = generateEd25519KeyPair();
+    const deviceId = randomUUID();
+    const deviceCert = issueDeviceCert(alice.identity.privateKey, {
+      handle: 'alice',
+      deviceId,
+      signatureKey: device.publicKey,
+      createdAt: Math.floor(Date.now() / 1000),
+    });
+    const extra = createTsMlsEngine({ devicePrivateKey: device.privateKey });
+    const [keyPackage] = await extra.generateKeyPackages(1, {
+      handle: 'alice',
+      identityKey: alice.identity.publicKey,
+      deviceId,
+      deviceCert,
+    });
+    const expiresAt = later();
+    const approvalId = 'apr-owner-device';
+    const signature = signWithLabel(
+      alice.identity.privateKey,
+      SignatureLabel.add,
+      addApprovalContent({
+        topicId,
+        approvalId,
+        inviteeIdentityKey: alice.identity.publicKey,
+        inviteeDeviceKey: device.publicKey,
+        role: 'member',
+        expiresAt,
+      }),
     );
-    expect(decision).toMatchObject({ ok: false, reason: 'remove targets the topic owner' });
+    const added = await owner.stageCommit({
+      adds: [{ keyPackage: keyPackage!.publicKeyPackage, approvalId, expiresAt, signature }],
+    });
+    await board.post(owner, added, [carolSession]);
+    const epoch = carolSession.epoch;
+    const ownerLeaf = owner.members().find((member) => bytesEqual(member.signatureKey, device.publicKey));
+    if (!ownerLeaf) throw new Error('owner identity leaf missing');
+    const copy = owner.engine.deserialize(owner.engine.serialize(owner.confirmedState()));
+    const removal = await owner.engine.commit(copy, { removes: [ownerLeaf.leafIndex], authenticatedData: new Uint8Array() });
+    expect(await carolSession.receive(board.seq + 1, removal.commit)).toMatchObject({
+      kind: 'halted',
+      reason: 'remove targets the topic owner',
+    });
+    expect(carolSession.epoch).toBe(epoch);
+  });
+
+  it('rejects a leave whose author.handle does not match the sender', async () => {
+    const bob = makePerson('bob');
+    const carol = makePerson('carol');
+    const { owner, board, session } = await connected([bob, carol]);
+    const bobSession = session.get(bob)!;
+    const carolSession = session.get(carol)!;
+    const epoch = carolSession.epoch;
+    const copy = bob.engine.deserialize(bob.engine.serialize(bobSession.confirmedState()));
+    const encrypted = await bob.engine.encrypt(
+      copy,
+      encodeEnvelope({
+        v: 1,
+        id: 'msg_mismatch_leave',
+        type: 'leave',
+        ts: new Date().toISOString(),
+        author: { handle: 'alice' },
+        reply_to: null,
+        payload: {},
+        approval: null,
+      }),
+    );
+    const seq = board.seq + 1;
+    expect((await owner.receive(seq, encrypted.message)).kind).toBe('application');
+    expect((await carolSession.receive(seq, encrypted.message)).kind).toBe('application');
+    const bobLeaf = owner.members().find((member) => member.credential.handle === 'bob')!.leafIndex;
+    const cited = encodeCommitApprovals({
+      adds: [],
+      removes: [{ kind: 'leave', approvalId: 'apr-mismatch', deviceKey: bob.device.publicKey, leaveSeq: seq }],
+    });
+    const ownerCopy = owner.engine.deserialize(owner.engine.serialize(owner.confirmedState()));
+    const bad = await owner.engine.commit(ownerCopy, { removes: [bobLeaf], authenticatedData: cited });
+    expect(await carolSession.receive(seq + 1, bad.commit)).toMatchObject({
+      kind: 'halted',
+      reason: 'leave_seq is not a leave message',
+    });
+    expect(carolSession.epoch).toBe(epoch);
   });
 
   it('rejects a self-update that rebinds the leaf credential', async () => {
