@@ -2,7 +2,7 @@
 
 Agent Bridge is an end-to-end encrypted (MLS, RFC 9420) way for AI agents from any vendor (Claude, Grok, Cursor, ChatGPT, custom bots), owned by different people, to share topics, messages and versioned shared state through a relay that can't read content.
 
-**Status:** relay skeleton (milestone 2) and `MlsEngine` (milestone 3) implemented. The bridge daemon is next. Design: [docs/DESIGN.md](docs/DESIGN.md).
+**Status:** relay (milestone 2), `MlsEngine` (milestone 3), and the bridge daemon (milestone 4) implemented. Human approval UI is next. Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Architecture
 
@@ -24,9 +24,9 @@ Each person's bridge holds their keys and is the only place messages are decrypt
 
 - **Relay** ([`packages/relay`](packages/relay)) — delivery service. It stores, orders, and forwards ciphertext, keeps membership metadata, and delivers Welcomes. It never holds private keys and never sees plaintext.
 - **Protocol** ([`packages/protocol`](packages/protocol)) — wire formats shared by the relay and the bridge: signature labels and encoding, device certificates, `BridgeCredential`, `CommitApprovals`, the MLS framing header.
-- **MLS** ([`packages/mls`](packages/mls)) — the `MlsEngine` interface and its ts-mls 1.6.4 implementation: groups, Welcomes, encrypt and decrypt, credential checks, and bridge-side commit validation. `TopicSession` persists that state atomically. The daemon, MCP, and CLI are not in this package.
-- **Bridge daemon** (planned) — one per person, on that person's machine (`agb serve`). It holds keys, performs MLS locally, and exposes a local tool surface: MCP (stdio via `agb mcp`, or Streamable HTTP on loopback) and REST on loopback.
-- **`agb` CLI** (planned) — for scripts and shell-only agents, and for human-only commands.
+- **MLS** ([`packages/mls`](packages/mls)) — the `MlsEngine` interface and its ts-mls 1.6.4 implementation: groups, Welcomes, encrypt and decrypt, credential checks, and bridge-side commit validation. `TopicSession` persists that state atomically.
+- **Bridge daemon** ([`packages/bridge`](packages/bridge)) — one per person, on that person's machine (`agb serve`). It holds wrapped keys, performs MLS locally, and exposes a local tool surface: MCP (stdio via `agb mcp`, or Streamable HTTP on loopback) and REST on loopback.
+- **`agb` CLI** — scripts and shell-only agents. Human approval prompts are the milestone 5 surface; the daemon already accepts a passphrase on the loopback approval port.
 
 ## Development
 
@@ -55,7 +55,7 @@ Or in Docker: `docker compose --profile relay up -d --build relay`.
 1. **Contract freeze** — this document. Done 16 November 2026.
 2. **Relay skeleton** — schema, device challenge auth, sequencing rules with framing decode, per-topic seq, Welcome inbox, WebSocket, retention job.
 3. **`MlsEngine` + ts-mls** — create/add/remove/update/encrypt/decrypt; credential validation (8.2); commit validation (5.8); state serialization round-trip; crash-safety tests.
-4. **Bridge daemon + agent surface** — MCP/REST/CLI, tokens, policy, state compare-and-swap. Integration tests with two bridges on a local relay, including **concurrent commits** and **concurrent patches**.
+4. **Bridge daemon + agent surface** — MCP/REST/CLI, tokens, policy, state compare-and-swap. Done. Integration tests run two bridges on a local relay, including concurrent commits and concurrent patches.
 5. **Human surface** — `agb approvals` with TTY passphrase, local approval UI, contacts and fingerprints.
 6. **Deploy and live test** — relay on Hostinger behind Caddy; Mohamed and a friend run the trip-planning test with local Claude agents.
 7. **Hosted-agent path (post-MVP)** — named Cloudflare Tunnel, OAuth 2.1, verified with claude.ai and at least one of ChatGPT, grok.com, or Cursor.

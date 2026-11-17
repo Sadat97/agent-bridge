@@ -1,15 +1,18 @@
 export { MlsOperationError } from './errors.ts';
+export { ReasonCode, REASON_TEXT, explainReason, toMlsOperationError } from './reasons.ts';
 export { evaluateCommit } from './commit-policy.ts';
 export type { CommitDecision, CommitPolicyContext, RecordedMessage } from './commit-policy.ts';
 export { encodeEnvelope, parseEnvelope, MESSAGE_TYPES } from './envelope.ts';
 export type { Envelope, MessageType } from './envelope.ts';
 export { readKeyPackage } from './key-package.ts';
 export { MlsStore } from './store.ts';
-export type { IdentityPin, StoredMessage, TopicRole, TopicStatus } from './store.ts';
+export type { IdentityPin, SecretSealer, StoreDb, StoredMessage, TopicRole, TopicStatus } from './store.ts';
 export { replenishKeyPackages, TopicSession } from './session.ts';
 export type {
   AddRequest,
   OutgoingMessage,
+  PersistHook,
+  PersistedFrame,
   ReceiveResult,
   RelayAdd,
   RelayRemove,

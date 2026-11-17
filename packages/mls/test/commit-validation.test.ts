@@ -276,7 +276,7 @@ describe('commit validation', () => {
     const before = session2.get(bob2)!.epoch;
     expect((await session2.get(bob2)!.receive(board2.seq + 1, psk.commit)).kind).toBe('halted');
     expect(session2.get(bob2)!.epoch).toBe(before);
-    expect(session2.get(bob2)!.haltReason).toMatch(/psk/i);
+    expect(session2.get(bob2)!.haltReason).toBe('unsupported_proposal');
 
     const bob3 = makePerson('bob');
     const { owner: owner3, board: board3, session: session3 } = await connected([bob3]);

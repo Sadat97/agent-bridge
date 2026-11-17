@@ -25,8 +25,11 @@ import { encodeEnvelope, parseEnvelope } from './envelope.ts';
 import type { Envelope, MessageType } from './envelope.ts';
 import { MlsOperationError } from './errors.ts';
 import { readKeyPackage } from './key-package.ts';
+import { ReasonCode, REASON_TEXT } from './reasons.ts';
+import { toMlsOperationError } from './reasons.ts';
 import { MlsStore } from './store.ts';
-import type { IdentityPin, PendingRow, TopicRole, TopicStatus } from './store.ts';
+import type { IdentityPin, PendingRow, StoreDb, TopicRole, TopicStatus } from './store.ts';
+import { UNPUBLISHED_GENERATION_SKIP } from './ts-mls-engine.ts';
 import type { CommitInspection, Credential, GroupState, Member, MlsEngine, ProcessResult } from './types.ts';
 
 const KEY_PACKAGE_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -39,6 +42,8 @@ export interface OutgoingMessage {
   replyTo?: string | null;
   approval?: { sig: string } | null;
   authorAgent?: string;
+  /** When set, the envelope uses this timestamp so a signature over it stays valid. */
+  ts?: string;
 }
 
 export interface AddRequest {
@@ -89,6 +94,22 @@ export type ReceiveResult =
   | { kind: 'application'; sender: Member; envelope: Envelope | null; authorMatches: boolean }
   | { kind: 'commit'; committer: Member; added: Member[]; removed: Member[] };
 
+/** What a bridge records in the same transaction as the MLS state for this seq. */
+export interface PersistedFrame {
+  topicId: string;
+  seq: number;
+  kind: 'application' | 'commit';
+  envelope: Envelope | null;
+  authorMatches: boolean;
+  sender: Member;
+}
+
+/**
+ * Runs inside the write transaction. Return a halt code to mark the topic
+ * halted after the seq is persisted (used when shared state has diverged).
+ */
+export type PersistHook = (db: StoreDb, frame: PersistedFrame) => string | void;
+
 interface Pending extends StagedOutbound {
   mlsState: Uint8Array;
   envelope?: Envelope;
@@ -113,6 +134,12 @@ export class TopicSession {
   status: TopicStatus;
   epoch: bigint;
   lastSeq: number;
+  /** Application drafts discarded in this epoch since the last sent application message. */
+  unpublishedApplication = 0;
+  /** Handshake drafts discarded in this epoch. Any accepted commit clears both counters. */
+  unpublishedHandshake = 0;
+  /** Optional. The bridge uses it to store the envelope and shared state atomically. */
+  onPersisted: PersistHook | undefined = undefined;
   haltReason: string | null = null;
   readonly #ourHandle: string;
   readonly #devicePublicKey: Uint8Array;
@@ -129,6 +156,8 @@ export class TopicSession {
     status: TopicStatus;
     epoch: bigint;
     lastSeq: number;
+    unpublishedApplication: number;
+    unpublishedHandshake: number;
     haltReason: string | null;
     ourHandle: string;
     devicePublicKey: Uint8Array;
@@ -143,6 +172,8 @@ export class TopicSession {
     this.status = init.status;
     this.epoch = init.epoch;
     this.lastSeq = init.lastSeq;
+    this.unpublishedApplication = init.unpublishedApplication;
+    this.unpublishedHandshake = init.unpublishedHandshake;
     this.haltReason = init.haltReason;
     this.#ourHandle = init.ourHandle;
     this.#devicePublicKey = init.devicePublicKey;
@@ -206,7 +237,9 @@ export class TopicSession {
       }
     }
     if (!state || !usedRef) {
-      throw lastError instanceof Error ? lastError : new MlsOperationError('mls_error', 'no KeyPackage matched the Welcome');
+      throw lastError === undefined
+        ? new MlsOperationError('mls_error', 'no KeyPackage matched the Welcome')
+        : toMlsOperationError(lastError);
     }
     const members = opts.engine.members(state);
     if (!members.some((member) => bytesEqual(member.credential.identityKey, opts.ownerIdentityKey))) {
@@ -258,6 +291,8 @@ export class TopicSession {
       status: row.status,
       epoch: engine.epoch(confirmed),
       lastSeq: row.lastSeq,
+      unpublishedApplication: row.unpublishedApplication,
+      unpublishedHandshake: row.unpublishedHandshake,
       haltReason: row.haltReason,
       ourHandle: row.ourHandle,
       devicePublicKey: row.devicePublicKey,
@@ -414,6 +449,11 @@ export class TopicSession {
 
   async confirmStaged(seq: number): Promise<void> {
     await this.#exclusive(async () => {
+      // A WebSocket echo can confirm the same seq before the POST handler does.
+      if (!this.#pending) {
+        if (seq <= this.lastSeq) return;
+        throw new MlsOperationError('mls_error', 'no staged outbound');
+      }
       this.#confirm(seq);
     });
   }
@@ -424,9 +464,17 @@ export class TopicSession {
       if (this.#pending.kind === 'application') {
         // The ciphertext may be dropped. The generation it consumed is not:
         // the next encrypt starts from this state, so it is a new generation.
-        // Peers who never saw the ciphertext skip that generation.
+        // Peers who never saw the ciphertext skip that generation. Past the
+        // cap they cannot, so the draft stays staged and the caller must
+        // send it or commit a self-update once this one is out of the way.
+        this.#refuseBurn('application');
         const next = this.engine.deserialize(this.#pending.mlsState);
-        this.store.keepRatchet(this.topicId, this.#pending.mlsState, this.engine.epoch(next));
+        const application = this.unpublishedApplication + 1;
+        this.store.keepRatchet(this.topicId, this.#pending.mlsState, this.engine.epoch(next), {
+          application,
+          handshake: this.unpublishedHandshake,
+        });
+        this.unpublishedApplication = application;
         this.#confirmed = next;
         this.epoch = this.engine.epoch(next);
         this.#pending = undefined;
@@ -435,10 +483,31 @@ export class TopicSession {
       // The pending commit state is already the next epoch. Keeping it would
       // desynchronize us from peers. Burn one handshake generation in this
       // epoch instead, so the rebuilt commit does not reuse it.
+      this.#refuseBurn('commit');
       const burned = await this.engine.discardHandshakeGeneration(this.#confirmed);
-      this.store.keepRatchet(this.topicId, this.engine.serialize(burned), this.engine.epoch(burned));
+      const handshake = this.unpublishedHandshake + 1;
+      this.store.keepRatchet(this.topicId, this.engine.serialize(burned), this.engine.epoch(burned), {
+        application: this.unpublishedApplication,
+        handshake,
+      });
+      this.unpublishedHandshake = handshake;
       this.#confirmed = burned;
       this.epoch = this.engine.epoch(burned);
+      this.#pending = undefined;
+    });
+  }
+
+  /**
+   * Forget a staged ciphertext without advancing the ratchet. The confirmed
+   * state still has that generation, so the caller must commit a new epoch
+   * before encrypting again. Used when an abort would pass the unpublished
+   * cap: the commit makes the ciphertext stale instead of burning one more
+   * generation peers cannot skip.
+   */
+  async dropStaged(): Promise<void> {
+    await this.#exclusive(async () => {
+      if (!this.#pending) return;
+      this.store.clearPending(this.topicId);
       this.#pending = undefined;
     });
   }
@@ -458,9 +527,7 @@ export class TopicSession {
       try {
         header = decodeMlsMessageHeader(message);
       } catch (err) {
-        const reason = err instanceof Error ? err.message : 'message could not be decoded';
-        this.#halt(seq, reason);
-        return { kind: 'halted', reason };
+        return this.#haltMapped(seq, err);
       }
       if (header.wireFormat !== 'private_message') {
         this.#halt(seq, 'not a PrivateMessage');
@@ -486,12 +553,10 @@ export class TopicSession {
           return decision.ok;
         });
       } catch (err) {
-        const reason = err instanceof Error ? err.message : 'message could not be processed';
-        // A gap larger than UNPUBLISHED_GENERATION_SKIP is not a bad frame and
-        // not a commit the group cannot follow. Leave the topic active.
-        if (/too far in the future/i.test(reason)) throw err;
-        this.#halt(seq, reason);
-        return { kind: 'halted', reason };
+        // A gap past the cap cannot be skipped: the relay's seq is contiguous.
+        // Halting is the same terminal case as a bad frame. Staying active
+        // would retry the same bytes forever.
+        return this.#haltMapped(seq, err);
       }
 
       if (result.kind === 'rejected') {
@@ -510,35 +575,73 @@ export class TopicSession {
         };
         if (mergeIntoPending && this.#pending) {
           const mlsState = this.engine.serialize(result.next);
-          this.store.writeTopic(this.topicId, {
-            mlsState,
-            epoch: this.epoch,
-            lastSeq: seq,
-            status: this.status,
-            clearPending: false,
-            preserveConfirmed: true,
-            message: record,
-          });
+          const frame: PersistedFrame = {
+            topicId: this.topicId,
+            seq,
+            kind: 'application',
+            envelope: authorMatches ? envelope : null,
+            authorMatches,
+            sender: result.sender,
+          };
+          let halt: string | undefined;
+          this.store.writeTopic(
+            this.topicId,
+            {
+              mlsState,
+              epoch: this.epoch,
+              lastSeq: seq,
+              status: this.status,
+              clearPending: false,
+              preserveConfirmed: true,
+              message: record,
+            },
+            this.onPersisted
+              ? (db) => {
+                  const reason = this.onPersisted?.(db, frame);
+                  if (!reason) return;
+                  halt = reason;
+                  db.prepare(`UPDATE topics SET status = 'halted', halt_reason = ?, halt_seq = ? WHERE topic_id = ?`).run(
+                    reason,
+                    seq,
+                    this.topicId,
+                  );
+                }
+              : undefined,
+          );
           this.#pending = { ...this.#pending, mlsState, epoch: this.engine.epoch(result.next) };
           this.lastSeq = seq;
+          if (halt) {
+            this.status = 'halted';
+            this.haltReason = halt;
+          }
           return { kind: 'application', sender: result.sender, envelope: authorMatches ? envelope : null, authorMatches };
         }
-        this.store.writeTopic(this.topicId, {
+        const halt = this.#write({
           mlsState: this.engine.serialize(result.next),
           epoch: this.engine.epoch(result.next),
           lastSeq: seq,
           status: this.status,
           clearPending: true,
           message: record,
+          frame: {
+            topicId: this.topicId,
+            seq,
+            kind: 'application',
+            envelope: authorMatches ? envelope : null,
+            authorMatches,
+            sender: result.sender,
+          },
         });
-        this.#adopt(result.next, seq, this.status);
+        this.#adopt(result.next, seq, halt ? 'halted' : this.status);
         return { kind: 'application', sender: result.sender, envelope: authorMatches ? envelope : null, authorMatches };
       }
 
       if (!decision || !decision.ok) throw new MlsOperationError('mls_error', 'commit was applied without a policy decision');
       const removedSelf = result.removed.some((member) => bytesEqual(member.signatureKey, this.#devicePublicKey));
       const status: TopicStatus = removedSelf ? 'left' : this.status;
-      this.store.writeTopic(this.topicId, {
+      // A commit opens a new epoch, so unpublished drafts from the old epoch
+      // are no longer on the ratchet peers will use.
+      const halt = this.#write({
         mlsState: this.engine.serialize(result.next),
         epoch: this.engine.epoch(result.next),
         lastSeq: seq,
@@ -547,8 +650,20 @@ export class TopicSession {
         message: { signatureKey: result.committer.signatureKey, type: 'commit', authorMatches: true },
         approvalIds: decision.approvalIds,
         pins: decision.pins,
+        unpublishedApplication: 0,
+        unpublishedHandshake: 0,
+        frame: {
+          topicId: this.topicId,
+          seq,
+          kind: 'commit',
+          envelope: null,
+          authorMatches: true,
+          sender: result.committer,
+        },
       });
-      this.#adopt(result.next, seq, status);
+      this.unpublishedApplication = 0;
+      this.unpublishedHandshake = 0;
+      this.#adopt(result.next, seq, halt ? 'halted' : status);
       return { kind: 'commit', committer: result.committer, added: result.added, removed: result.removed };
     });
   }
@@ -573,7 +688,8 @@ export class TopicSession {
     if (seq !== this.lastSeq + 1) throw new MlsOperationError('seq_gap', `expected seq ${this.lastSeq + 1}, got ${seq}`);
     const next = this.engine.deserialize(pending.mlsState);
     const envelope = pending.envelope;
-    this.store.writeTopic(this.topicId, {
+    const commit = pending.kind === 'commit';
+    const halt = this.#write({
       mlsState: pending.mlsState,
       epoch: this.engine.epoch(next),
       lastSeq: seq,
@@ -586,8 +702,89 @@ export class TopicSession {
       },
       approvalIds: pending.approvalIds,
       pins: pending.pins,
+      // The peer will see this generation, so the unpublished gap closes.
+      // A commit also starts a new epoch and clears the handshake counter.
+      unpublishedApplication: 0,
+      ...(commit ? { unpublishedHandshake: 0 } : {}),
+      frame: {
+        topicId: this.topicId,
+        seq,
+        kind: pending.kind,
+        envelope: envelope ?? null,
+        authorMatches: envelope ? envelope.author.handle === this.#ourHandle : true,
+        sender: this.#self(),
+      },
     });
-    this.#adopt(next, seq, this.status);
+    this.unpublishedApplication = 0;
+    if (commit) this.unpublishedHandshake = 0;
+    this.#adopt(next, seq, halt ? 'halted' : this.status);
+  }
+
+  /**
+   * Another discarded draft would make the next ciphertext more than
+   * UNPUBLISHED_GENERATION_SKIP generations ahead of a peer that has not
+   * seen the discarded ones. Leave the staged message in place.
+   */
+  #refuseBurn(kind: 'application' | 'commit'): void {
+    const used = kind === 'application' ? this.unpublishedApplication : this.unpublishedHandshake;
+    if (used >= UNPUBLISHED_GENERATION_SKIP) {
+      throw new MlsOperationError(ReasonCode.selfUpdateRequired, REASON_TEXT[ReasonCode.selfUpdateRequired]!);
+    }
+  }
+
+  #haltMapped(seq: number, err: unknown): ReceiveResult {
+    const mapped = toMlsOperationError(err);
+    this.#halt(seq, mapped.code);
+    return { kind: 'halted', reason: mapped.code };
+  }
+
+  /** Returns a halt code when the persist hook rejected the seq after it was written. */
+  #write(input: {
+    mlsState: Uint8Array;
+    epoch: bigint;
+    lastSeq: number;
+    status: TopicStatus;
+    clearPending: boolean;
+    preserveConfirmed?: boolean;
+    message?: { signatureKey: Uint8Array; type: string; authorMatches: boolean };
+    approvalIds?: string[];
+    pins?: IdentityPin[];
+    unpublishedApplication?: number;
+    unpublishedHandshake?: number;
+    frame: PersistedFrame;
+  }): string | undefined {
+    let halt: string | undefined;
+    const hook = this.onPersisted;
+    this.store.writeTopic(
+      this.topicId,
+      {
+        mlsState: input.mlsState,
+        epoch: input.epoch,
+        lastSeq: input.lastSeq,
+        status: input.status,
+        clearPending: input.clearPending,
+        ...(input.preserveConfirmed ? { preserveConfirmed: true } : {}),
+        ...(input.message ? { message: input.message } : {}),
+        ...(input.approvalIds ? { approvalIds: input.approvalIds } : {}),
+        ...(input.pins ? { pins: input.pins } : {}),
+        ...(input.unpublishedApplication !== undefined ? { unpublishedApplication: input.unpublishedApplication } : {}),
+        ...(input.unpublishedHandshake !== undefined ? { unpublishedHandshake: input.unpublishedHandshake } : {}),
+      },
+      hook
+        ? (db) => {
+            const reason = hook(db, input.frame);
+            if (!reason) return;
+            halt = reason;
+            db.prepare(`UPDATE topics SET status = 'halted', halt_reason = ?, halt_seq = ? WHERE topic_id = ?`).run(
+              reason,
+              input.frame.seq,
+              input.frame.topicId,
+            );
+          }
+        : undefined,
+    );
+    if (halt) this.haltReason = halt;
+    return halt;
   }
 
   #halt(seq: number, reason: string): void {
@@ -608,6 +805,8 @@ export class TopicSession {
   #assertCanSend(type: MessageType): void {
     if (this.status === 'halted') throw new MlsOperationError('topic_halted', this.haltReason ?? 'topic is halted');
     if (this.status === 'left') throw new MlsOperationError('topic_left', 'this bridge has left the topic');
+    if (this.status === 'closed') throw new MlsOperationError('topic_closed', 'topic is closed');
+    if (this.status === 'stale') throw new MlsOperationError('topic_stale', 'this device fell behind and must be re-added');
     if (this.status === 'pending_join' && type !== 'leave') {
       throw new MlsOperationError('topic_pending_join', 'accept the topic before posting');
     }
@@ -670,7 +869,7 @@ function createEnvelope(handle: string, input: OutgoingMessage): Envelope {
     v: 1,
     id: input.id ?? `msg_${randomBytes(16).toString('hex')}`,
     type: input.type,
-    ts: new Date().toISOString(),
+    ts: input.ts ?? new Date().toISOString(),
     author: input.authorAgent ? { handle, agent: input.authorAgent } : { handle },
     reply_to: input.replyTo ?? null,
     payload: input.payload ?? {},
