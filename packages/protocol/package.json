@@ -1,0 +1,13 @@
+{
+  "name": "@agent-bridge/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Wire formats shared by the relay and the bridge: TLS-style encoding, signature labels, device certificates, MLS framing headers.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "devDependencies": {
+    "ts-mls": "1.6.4"
+  }
+}
