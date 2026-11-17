@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { uuidToBytes } from '@agent-bridge/protocol';
-import { replenishKeyPackages, TopicSession } from '../src/index.ts';
+import { replenishKeyPackages, TopicSession, UNPUBLISHED_GENERATION_SKIP } from '../src/index.ts';
 import { connected, later, makePerson, reopen, signAdd, signRemove } from './helpers.ts';
 
 describe('multi-member sessions', () => {
@@ -119,37 +119,106 @@ describe('multi-member sessions', () => {
 
     await owner.confirmStaged(base + 2);
     const second = await owner.stageMessage({ type: 'update', body: 'two' });
-    const firstRead = await bob.engine.process(bobBefore, first.message, () => true);
-    expect(firstRead.kind).toBe('application');
-    await expect(bob.engine.process(bob.engine.deserialize(bob.engine.serialize(bobBefore)), second.message, () => true)).rejects.toThrow();
+    const firstRead = await bob.engine.process(bob.engine.deserialize(bob.engine.serialize(bobBefore)), first.message, () => true);
     if (firstRead.kind !== 'application') throw new Error('expected application');
     const secondRead = await bob.engine.process(firstRead.next, second.message, () => true);
-    expect(secondRead.kind).toBe('application');
+    if (secondRead.kind !== 'application') throw new Error('expected application');
+    await expect(bob.engine.process(secondRead.next, first.message, () => true)).rejects.toThrow(/past/);
   });
 
-  it('does not reuse an application generation after abort, and a skipped generation halts', async () => {
+  it('accepts the message after an aborted draft, and does not reuse that generation', async () => {
     const bob = makePerson('bob');
     const { owner, session } = await connected([bob]);
     const bobSession = session.get(bob)!;
     const base = bob.engine.deserialize(bob.engine.serialize(bobSession.confirmedState()));
-    const epoch = bobSession.epoch;
-    const before = bob.engine.serialize(bobSession.confirmedState());
     const first = await owner.stageMessage({ type: 'update', body: 'one' });
     await owner.abortStaged();
     expect(owner.staged()).toBeUndefined();
     const second = await owner.stageMessage({ type: 'update', body: 'two' });
+    await owner.confirmStaged(owner.lastSeq + 1);
 
     const fromBase = bob.engine.deserialize(bob.engine.serialize(base));
     expect((await bob.engine.process(fromBase, first.message, () => true)).kind).toBe('application');
-    await expect(bob.engine.process(bob.engine.deserialize(bob.engine.serialize(base)), second.message, () => true)).rejects.toThrow();
+    const skipped = await bob.engine.process(bob.engine.deserialize(bob.engine.serialize(base)), second.message, () => true);
+    expect(skipped.kind).toBe('application');
+    if (skipped.kind === 'application') expect(new TextDecoder().decode(skipped.plaintext)).toContain('"two"');
+    if (skipped.kind !== 'application') throw new Error('expected application');
+    await expect(bob.engine.process(skipped.next, first.message, () => true)).rejects.toThrow(/past/);
 
-    const halted = await bobSession.receive(bobSession.lastSeq + 1, second.message);
-    expect(halted).toMatchObject({ kind: 'halted' });
-    if (halted.kind === 'halted') expect(halted.reason.length).toBeGreaterThan(0);
+    const read = await bobSession.receive(bobSession.lastSeq + 1, second.message);
+    expect(read).toMatchObject({ kind: 'application', envelope: { body: 'two' } });
+    expect(bobSession.status).toBe('active');
+
+    const past = await bobSession.receive(bobSession.lastSeq + 1, first.message);
+    expect(past).toMatchObject({ kind: 'halted', reason: expect.stringMatching(/past/) });
     expect(bobSession.status).toBe('halted');
-    expect(bobSession.epoch).toBe(epoch);
-    expect(bob.engine.serialize(bobSession.confirmedState())).toEqual(before);
-    await expect(bobSession.stageMessage({ type: 'update', body: 'wedged' })).rejects.toMatchObject({ code: 'topic_halted' });
+  });
+
+  it('does not halt when a sender skips more unpublished generations than the cap', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP + 1; i++) {
+      await owner.stageMessage({ type: 'update', body: `draft ${i}` });
+      await owner.abortStaged();
+    }
+    const beyond = await owner.stageMessage({ type: 'update', body: 'beyond' });
+    await owner.confirmStaged(owner.lastSeq + 1);
+    await expect(bobSession.receive(bobSession.lastSeq + 1, beyond.message)).rejects.toThrow(/too far in the future/);
+    expect(bobSession.status).toBe('active');
+  });
+
+  it('does not halt the owner when a joiner aborts a leave and then posts', async () => {
+    const bob = makePerson('bob');
+    const alice = makePerson('alice');
+    const topicId = randomUUID();
+    const owner = await TopicSession.create({ store: alice.store, engine: alice.engine, topicId, credential: alice.credential });
+    const [keyPackage] = await replenishKeyPackages(bob.engine, bob.credential, bob.store, 1);
+    const expiresAt = later();
+    const staged = await owner.stageCommit({
+      adds: [{ keyPackage: keyPackage!, approvalId: 'apr-bob', expiresAt, signature: signAdd(alice, topicId, 'apr-bob', bob, expiresAt) }],
+    });
+    await owner.confirmStaged(1);
+    const joined = await TopicSession.join({
+      store: bob.store,
+      engine: bob.engine,
+      topicId,
+      welcome: staged.welcome!,
+      credential: bob.credential,
+      ownerIdentityKey: alice.identity.publicKey,
+      commitSeq: 1,
+    });
+    await joined.stageMessage({ type: 'leave' });
+    await joined.abortStaged();
+    await joined.acceptJoin();
+    const update = await joined.stageMessage({ type: 'update', body: 'still here' });
+    await joined.confirmStaged(2);
+    const read = await owner.receive(2, update.message);
+    expect(read).toMatchObject({ kind: 'application', envelope: { body: 'still here' } });
+    expect(owner.status).toBe('active');
+    expect(joined.status).toBe('active');
+  });
+
+  it('burns the handshake generation when a commit is aborted', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const epoch = bobSession.epoch;
+    const base = bob.engine.deserialize(bob.engine.serialize(bobSession.confirmedState()));
+    const first = await owner.stageCommit();
+    await owner.abortStaged();
+    const second = await owner.stageCommit();
+    expect(second.message).not.toEqual(first.message);
+
+    const applied = await bob.engine.process(bob.engine.deserialize(bob.engine.serialize(base)), second.message, () => true);
+    expect(applied.kind).toBe('commit');
+    if (applied.kind !== 'commit') throw new Error('expected commit');
+    await expect(bob.engine.process(applied.next, first.message, () => true)).rejects.toThrow(/past|epoch/);
+
+    const read = await bobSession.receive(bobSession.lastSeq + 1, second.message);
+    expect(read.kind).toBe('commit');
+    expect(bobSession.status).toBe('active');
+    expect(bobSession.epoch).toBe(epoch + 1n);
   });
 
   it('halts when the next commit cannot be framed', async () => {

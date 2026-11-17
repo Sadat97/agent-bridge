@@ -424,6 +424,7 @@ export class TopicSession {
       if (this.#pending.kind === 'application') {
         // The ciphertext may be dropped. The generation it consumed is not:
         // the next encrypt starts from this state, so it is a new generation.
+        // Peers who never saw the ciphertext skip that generation.
         const next = this.engine.deserialize(this.#pending.mlsState);
         this.store.keepRatchet(this.topicId, this.#pending.mlsState, this.engine.epoch(next));
         this.#confirmed = next;
@@ -431,8 +432,13 @@ export class TopicSession {
         this.#pending = undefined;
         return;
       }
-      // A commit draws fresh path secrets, so a rejected one can be rebuilt.
-      this.store.clearPending(this.topicId);
+      // The pending commit state is already the next epoch. Keeping it would
+      // desynchronize us from peers. Burn one handshake generation in this
+      // epoch instead, so the rebuilt commit does not reuse it.
+      const burned = await this.engine.discardHandshakeGeneration(this.#confirmed);
+      this.store.keepRatchet(this.topicId, this.engine.serialize(burned), this.engine.epoch(burned));
+      this.#confirmed = burned;
+      this.epoch = this.engine.epoch(burned);
       this.#pending = undefined;
     });
   }
@@ -481,6 +487,9 @@ export class TopicSession {
         });
       } catch (err) {
         const reason = err instanceof Error ? err.message : 'message could not be processed';
+        // A gap larger than UNPUBLISHED_GENERATION_SKIP is not a bad frame and
+        // not a commit the group cannot follow. Leave the topic active.
+        if (/too far in the future/i.test(reason)) throw err;
         this.#halt(seq, reason);
         return { kind: 'halted', reason };
       }

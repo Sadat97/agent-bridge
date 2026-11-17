@@ -93,4 +93,11 @@ export interface MlsEngine {
   groupId(state: GroupState): Uint8Array;
   serialize(state: GroupState): Uint8Array;
   deserialize(bytes: Uint8Array): GroupState;
+  /**
+   * Consume one handshake generation in the current epoch and return that
+   * state. Used when a commit ciphertext is discarded: the next commit must
+   * not reuse the generation, and it must stay in this epoch so peers can
+   * still decrypt it.
+   */
+  discardHandshakeGeneration(state: GroupState): Promise<GroupState>;
 }

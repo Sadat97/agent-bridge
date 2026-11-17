@@ -263,8 +263,8 @@ export class MlsStore {
   }
 
   /**
-   * The staged application ciphertext is being discarded, but its ratchet
-   * generation stays consumed. The next encrypt continues from `mlsState`.
+   * The staged ciphertext is being discarded, but the ratchet generation it
+   * consumed stays consumed. The next encrypt continues from `mlsState`.
    */
   keepRatchet(topicId: string, mlsState: Uint8Array, epoch: bigint): void {
     this.transaction(() => {

@@ -53,6 +53,8 @@ import { defaultKeyRetentionConfig } from 'ts-mls/keyRetentionConfig.js';
 import { defaultClientConfig } from 'ts-mls/clientConfig.js';
 import type { ClientConfig } from 'ts-mls/clientConfig.js';
 import { decodeKeyPackage, encodeKeyPackage } from 'ts-mls/keyPackage.js';
+import { consumeRatchet } from 'ts-mls/secretTree.js';
+import { leafToNodeIndex, toLeafIndex } from 'ts-mls/treemath.js';
 import type { LeafNode, PrivateKeyPackage } from 'ts-mls';
 import { MlsOperationError } from './errors.ts';
 import { TS_MLS_ENGINE_ID } from './types.ts';
@@ -71,6 +73,15 @@ import type {
 const KEY_PACKAGE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const LIFETIME_SKEW_SECONDS = 60n;
 const STATE_VERSION = 1;
+
+/**
+ * Unpublished drafts a receiver will skip. Each aborted application message
+ * or commit burns one generation the peer never sees. 32 covers a long run of
+ * discarded drafts; a larger gap is not applied and does not halt the topic.
+ * Skipped keys are not kept (`retainKeysForGenerations: 0`), so an unpublished
+ * ciphertext cannot be decrypted once the peer has moved past it.
+ */
+export const UNPUBLISHED_GENERATION_SKIP = 32;
 
 class TsGroup implements GroupState {
   readonly engineId = TS_MLS_ENGINE_ID;
@@ -127,15 +138,13 @@ class TsMlsEngine implements MlsEngine {
       ...defaultClientConfig,
       // The relay rejects stale epochs, so old epoch secrets are not kept.
       // retainKeysForEpochs: 0 does not drop them (Array.slice(-0) keeps all).
-      // A PrivateMessage is encrypted under the ratchet's current generation, so
-      // the in-order difference is 0. 0 here rejects any skipped generation;
-      // 1 would still decrypt a message one generation ahead.
+      // Skipped generations are deleted, but a peer must be able to step over
+      // drafts this sender aborted. See UNPUBLISHED_GENERATION_SKIP.
       keyRetentionConfig: {
         ...defaultKeyRetentionConfig,
         retainKeysForGenerations: 0,
-        // 0 does not drop history: Array.prototype.slice(-0) keeps every epoch.
         retainKeysForEpochs: 1,
-        maximumForwardRatchetSteps: 0,
+        maximumForwardRatchetSteps: UNPUBLISHED_GENERATION_SKIP,
       },
       authService: {
         async validateCredential(credential, signaturePublicKey) {
@@ -309,6 +318,15 @@ class TsMlsEngine implements MlsEngine {
     // Encoding a copy drops epoch history and skipped generations. The live
     // state is left as it is.
     return new TlsWriter().u8(STATE_VERSION).opaque(encodeGroupState(forgetOldSecrets(assertGroup(state).client))).finish();
+  }
+
+  async discardHandshakeGeneration(state: GroupState): Promise<GroupState> {
+    const group = this.#clone(state);
+    const impl = await this.#ciphersuite();
+    const nodeIndex = leafToNodeIndex(toLeafIndex(group.client.privatePath.leafIndex));
+    const consumed = await consumeRatchet(group.client.secretTree, nodeIndex, 'commit', impl);
+    consumed.consumed.forEach(zeroOutUint8Array);
+    return new TsGroup(forgetOldSecrets({ ...group.client, secretTree: consumed.newTree }));
   }
 
   deserialize(bytes: Uint8Array): GroupState {

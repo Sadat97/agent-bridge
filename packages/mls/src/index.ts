@@ -16,7 +16,7 @@ export type {
   RemoveRequest,
   StagedOutbound,
 } from './session.ts';
-export { createTsMlsEngine } from './ts-mls-engine.ts';
+export { createTsMlsEngine, UNPUBLISHED_GENERATION_SKIP } from './ts-mls-engine.ts';
 export type { TsMlsEngineOptions } from './ts-mls-engine.ts';
 export { TS_MLS_ENGINE_ID } from './types.ts';
 export type {
