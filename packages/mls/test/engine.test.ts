@@ -8,6 +8,7 @@ import {
   uuidToBytes,
 } from '@agent-bridge/protocol';
 import { generateKeyPackage, createGroup, createCommit, defaultCapabilities, defaultLifetime, encodeMlsMessage, getCiphersuiteFromName, getCiphersuiteImpl } from 'ts-mls';
+import { debugClientState } from '../src/ts-mls-engine.ts';
 import { replenishKeyPackages } from '../src/index.ts';
 import { makePerson } from './helpers.ts';
 
@@ -91,6 +92,8 @@ describe('ts-mls engine', () => {
     const carolState = await carol.engine.join(withCarol.welcome!, carolPackage!.privateKeyPackage);
     const bobSeesAdd = await bob.engine.process(bobState, withCarol.commit, accept);
     if (bobSeesAdd.kind !== 'commit') throw new Error(`expected commit, got ${bobSeesAdd.kind}`);
+    expect(bobSeesAdd.added[0]?.leafIndex).toBeGreaterThanOrEqual(0);
+    expect(bobSeesAdd.added[0]?.credential.handle).toBe('carol');
     bobState = bobSeesAdd.next;
 
     const bobLeaf = alice.engine.members(aliceState).find((member) => member.credential.handle === 'bob')!.leafIndex;
@@ -166,5 +169,25 @@ describe('ts-mls engine', () => {
       pins: bob.store.pins,
     });
     await expect(pinned.join(added.welcome!, bobPackage!.privateKeyPackage)).rejects.toThrow(/credential/i);
+  });
+
+  it('does not persist previous-epoch secrets', async () => {
+    const alice = makePerson('alice');
+    const topicId = randomUUID();
+    let state = await alice.engine.createGroup(uuidToBytes(topicId), alice.credential);
+    const oldSecret = debugClientState(state).secretTree[0]?.application.secret;
+    if (!oldSecret) throw new Error('missing epoch secret');
+    const updated = await alice.engine.commit(state, { authenticatedData: new Uint8Array() });
+    state = updated.pending;
+    const again = await alice.engine.commit(state, { authenticatedData: new Uint8Array() });
+    const bytes = alice.engine.serialize(again.pending);
+    expect(Buffer.from(bytes).includes(Buffer.from(oldSecret))).toBe(false);
+    const restored = debugClientState(alice.engine.deserialize(bytes));
+    expect(restored.historicalReceiverData.size).toBe(0);
+    for (const node of restored.secretTree) {
+      if (!node) continue;
+      expect(Object.keys(node.application.unusedGenerations)).toEqual([]);
+      expect(Object.keys(node.handshake.unusedGenerations)).toEqual([]);
+    }
   });
 });

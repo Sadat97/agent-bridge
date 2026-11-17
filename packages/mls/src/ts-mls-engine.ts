@@ -26,6 +26,7 @@ import {
   ed25519PublicKeyFromSeed,
   encodeBridgeCredential,
   keyPackageRef,
+  toBase64,
   TlsReader,
   TlsWriter,
   validateLeafCredential,
@@ -48,6 +49,7 @@ import {
   zeroOutUint8Array,
 } from 'ts-mls';
 import type { CiphersuiteImpl, ClientState, Credential as MlsCredential, KeyPackage, Proposal, SecretTree } from 'ts-mls';
+import { defaultKeyRetentionConfig } from 'ts-mls/keyRetentionConfig.js';
 import { defaultClientConfig } from 'ts-mls/clientConfig.js';
 import type { ClientConfig } from 'ts-mls/clientConfig.js';
 import { decodeKeyPackage, encodeKeyPackage } from 'ts-mls/keyPackage.js';
@@ -123,6 +125,16 @@ class TsMlsEngine implements MlsEngine {
     this.#pins = options.pins;
     this.#config = {
       ...defaultClientConfig,
+      // The relay rejects stale epochs, so old epoch secrets are not kept.
+      // retainKeysForEpochs: 0 does not drop them (Array.slice(-0) keeps all).
+      // A PrivateMessage is encrypted under the ratchet's current generation, so
+      // the in-order difference is 0. 0 here rejects any skipped generation;
+      // 1 would still decrypt a message one generation ahead.
+      keyRetentionConfig: {
+        ...defaultKeyRetentionConfig,
+        retainKeysForGenerations: 0,
+        maximumForwardRatchetSteps: 0,
+      },
       authService: {
         async validateCredential(credential, signaturePublicKey) {
           if (credential.credentialType !== 'basic') return false;
@@ -191,11 +203,12 @@ class TsMlsEngine implements MlsEngine {
     );
     result.consumed.forEach(zeroOutUint8Array);
     const commit = encodeMlsMessage(result.commit);
-    if (!result.welcome) return { commit, pending: new TsGroup(result.newState) };
+    const pending = new TsGroup(forgetOldSecrets(result.newState));
+    if (!result.welcome) return { commit, pending };
     return {
       commit,
       welcome: encodeMlsMessage({ welcome: result.welcome, wireformat: 'mls_welcome', version: 'mls10' }),
-      pending: new TsGroup(result.newState),
+      pending,
     };
   }
 
@@ -216,6 +229,7 @@ class TsMlsEngine implements MlsEngine {
     const decoded = decodeMlsMessage(message, 0);
     if (!decoded || decoded[0].wireformat !== 'mls_private_message') throw new MlsOperationError('mls_error', 'not a PrivateMessage');
 
+    const beforeMembers = this.members(group);
     const before = ratchetFingerprint(group.client.secretTree);
     let inspection: CommitInspection | undefined;
     let rejectReason = 'commit rejected by policy';
@@ -250,17 +264,24 @@ class TsMlsEngine implements MlsEngine {
       result.consumed.forEach(zeroOutUint8Array);
       const sender = memberAt(group.client, changedLeaf(before, ratchetFingerprint(result.newState.secretTree)));
       if (!sender) throw new MlsOperationError('mls_error', 'application sender is not a member');
-      return { kind: 'application', sender, plaintext: result.message, next: new TsGroup(result.newState) };
+      return { kind: 'application', sender, plaintext: result.message, next: new TsGroup(forgetOldSecrets(result.newState)) };
     }
     if (result.actionTaken === 'reject' || !inspection) return { kind: 'rejected', reason: rejectReason };
     result.consumed.forEach(zeroOutUint8Array);
-    return {
-      kind: 'commit',
-      committer: inspection.committer,
-      added: inspection.proposals.flatMap((proposal) => (proposal.kind === 'add' && proposal.added ? [proposal.added] : [])),
-      removed: inspection.proposals.flatMap((proposal) => (proposal.kind === 'remove' && proposal.removed ? [proposal.removed] : [])),
-      next: new TsGroup(result.newState),
-    };
+    const next = new TsGroup(forgetOldSecrets(result.newState));
+    const added = inspection.proposals.flatMap((proposal) => (proposal.kind === 'add' && proposal.added ? [proposal.added] : []));
+    const removed = inspection.proposals.flatMap((proposal) => (proposal.kind === 'remove' && proposal.removed ? [proposal.removed] : []));
+    // The update path is not a proposal. A member can otherwise replace the
+    // credential on their own leaf, and an update-only commit would be accepted.
+    if (credentialRebound(beforeMembers, this.members(next), added)) {
+      return { kind: 'rejected', reason: 'credential changed' };
+    }
+    const leafByKey = new Map(this.members(next).map((member) => [toBase64(member.signatureKey), member.leafIndex]));
+    for (const member of added) {
+      const leafIndex = leafByKey.get(toBase64(member.signatureKey));
+      if (leafIndex !== undefined) member.leafIndex = leafIndex;
+    }
+    return { kind: 'commit', committer: inspection.committer, added, removed, next };
   }
 
   members(state: GroupState): Member[] {
@@ -278,8 +299,14 @@ class TsMlsEngine implements MlsEngine {
     return assertGroup(state).client.groupContext.epoch;
   }
 
+  groupId(state: GroupState): Uint8Array {
+    return assertGroup(state).client.groupContext.groupId.slice();
+  }
+
   serialize(state: GroupState): Uint8Array {
-    return new TlsWriter().u8(STATE_VERSION).opaque(encodeGroupState(assertGroup(state).client)).finish();
+    // Encoding a copy drops epoch history and skipped generations. The live
+    // state is left as it is.
+    return new TlsWriter().u8(STATE_VERSION).opaque(encodeGroupState(forgetOldSecrets(assertGroup(state).client))).finish();
   }
 
   deserialize(bytes: Uint8Array): GroupState {
@@ -322,6 +349,36 @@ class TsMlsEngine implements MlsEngine {
       impl,
     );
   }
+}
+
+function forgetOldSecrets(client: ClientState): ClientState {
+  return {
+    ...client,
+    historicalReceiverData: new Map(),
+    secretTree: client.secretTree.map((node) => {
+      if (!node) return node;
+      return {
+        ...node,
+        application: { ...node.application, unusedGenerations: {} },
+        handshake: { ...node.handshake, unusedGenerations: {} },
+      };
+    }),
+  };
+}
+
+function credentialRebound(before: Member[], after: Member[], added: Member[]): boolean {
+  const previous = new Map(before.map((member) => [toBase64(member.signatureKey), encodeBridgeCredential(member.credential)]));
+  const addedKeys = new Set(added.map((member) => toBase64(member.signatureKey)));
+  for (const member of after) {
+    const key = toBase64(member.signatureKey);
+    const prior = previous.get(key);
+    if (prior === undefined) {
+      if (!addedKeys.has(key)) return true;
+      continue;
+    }
+    if (!bytesEqual(prior, encodeBridgeCredential(member.credential))) return true;
+  }
+  return false;
 }
 
 function keyPackageFromMessage(message: Uint8Array): KeyPackage {

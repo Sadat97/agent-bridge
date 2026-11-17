@@ -2,12 +2,15 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   addApprovalContent,
+  encodeBridgeCredential,
   encodeCommitApprovals,
+  issueDeviceCert,
   SignatureLabel,
   signWithLabel,
   utf8,
 } from '@agent-bridge/protocol';
-import { defaultCapabilities, defaultLifetime, generateKeyPackage, getCiphersuiteFromName, getCiphersuiteImpl } from 'ts-mls';
+import { createCommit, defaultCapabilities, defaultLifetime, encodeMlsMessage, generateKeyPackage, getCiphersuiteFromName, getCiphersuiteImpl } from 'ts-mls';
+import { debugClientState } from '../src/ts-mls-engine.ts';
 import { evaluateCommit, replenishKeyPackages } from '../src/index.ts';
 import { rawCommit } from './attack.ts';
 import { connected, later, makePerson, reopen, signAdd, signRemove } from './helpers.ts';
@@ -322,6 +325,54 @@ describe('commit validation', () => {
       },
     );
     expect(decision).toMatchObject({ ok: false, reason: 'remove targets the topic owner' });
+  });
+
+  it('rejects a self-update that rebinds the leaf credential', async () => {
+    const impl = await getCiphersuiteImpl(getCiphersuiteFromName('MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519'));
+    for (const variant of ['new-handle', 'new-identity'] as const) {
+      const bob = makePerson('bob');
+      const carol = makePerson('carol');
+      const { board, session } = await connected([bob, carol]);
+      const bobSession = session.get(bob)!;
+      const carolSession = session.get(carol)!;
+      const epoch = carolSession.epoch;
+      const handles = carolSession.members().map((member) => member.credential.handle).sort();
+      const sara = makePerson('sara');
+      const identity = variant === 'new-identity' ? sara.identity : bob.identity;
+      const deviceCert = issueDeviceCert(identity.privateKey, {
+        handle: 'sara',
+        deviceId: bob.deviceId,
+        signatureKey: bob.device.publicKey,
+        createdAt: Math.floor(Date.now() / 1000),
+      });
+      const client = debugClientState(bob.engine.deserialize(bob.engine.serialize(bobSession.confirmedState())));
+      const node = client.ratchetTree[client.privatePath.leafIndex * 2];
+      if (node?.nodeType !== 'leaf') throw new Error('missing leaf');
+      node.leaf = {
+        ...node.leaf,
+        credential: {
+          credentialType: 'basic',
+          identity: encodeBridgeCredential({
+            handle: 'sara',
+            identityKey: identity.publicKey,
+            deviceId: bob.deviceId,
+            deviceCert,
+          }),
+        },
+      };
+      const committed = await createCommit(
+        { state: client, cipherSuite: impl },
+        { extraProposals: [], ratchetTreeExtension: true, authenticatedData: new Uint8Array() },
+      );
+      const message = encodeMlsMessage(committed.commit);
+      expect(await carolSession.receive(board.seq + 1, message)).toMatchObject({
+        kind: 'halted',
+        reason: 'credential changed',
+      });
+      expect(carolSession.epoch).toBe(epoch);
+      expect(carolSession.members().map((member) => member.credential.handle).sort()).toEqual(handles);
+      expect(carol.store.pins.has('sara')).toBe(false);
+    }
   });
 });
 

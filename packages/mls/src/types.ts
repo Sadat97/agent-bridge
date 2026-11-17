@@ -89,6 +89,8 @@ export interface MlsEngine {
   ): Promise<ProcessResult>;
   members(state: GroupState): Member[];
   epoch(state: GroupState): bigint;
+  /** MLS group_id. For a topic this is the 16 raw bytes of the topic id. */
+  groupId(state: GroupState): Uint8Array;
   serialize(state: GroupState): Uint8Array;
   deserialize(bytes: Uint8Array): GroupState;
 }

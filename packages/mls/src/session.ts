@@ -215,6 +215,9 @@ export class TopicSession {
     if (!members.some((member) => bytesEqual(member.signatureKey, devicePublicKey))) {
       throw new MlsOperationError('mls_error', 'this device is not in the joined group');
     }
+    if (!bytesEqual(opts.engine.groupId(state), uuidToBytes(opts.topicId))) {
+      throw new MlsOperationError('mls_error', 'Welcome group_id does not match the topic id');
+    }
     const pins = members.map((member) => ({ handle: member.credential.handle, identityKey: member.credential.identityKey }));
     opts.store.createTopic(
       {
@@ -418,6 +421,12 @@ export class TopicSession {
   async abortStaged(): Promise<void> {
     await this.#exclusive(async () => {
       if (!this.#pending) return;
+      // An application ciphertext already consumed a generation. Dropping it and
+      // encrypting again would authenticate a second plaintext with that generation.
+      // A commit draws fresh path secrets, so a rejected commit can be discarded.
+      if (this.#pending.kind === 'application') {
+        throw new MlsOperationError('outbound_pending', 'an application message has already consumed its ratchet generation');
+      }
       this.store.clearPending(this.topicId);
       this.#pending = undefined;
     });
@@ -434,22 +443,39 @@ export class TopicSession {
         return { kind: 'echo' };
       }
 
-      const header = decodeMlsMessageHeader(message);
-      if (header.wireFormat !== 'private_message') throw new MlsOperationError('mls_error', 'not a PrivateMessage');
-      if (!bytesEqual(header.groupId, uuidToBytes(this.topicId))) {
-        throw new MlsOperationError('mls_error', 'MLS group_id does not match the topic');
+      let header;
+      try {
+        header = decodeMlsMessageHeader(message);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : 'message could not be decoded';
+        this.#halt(seq, reason);
+        return { kind: 'halted', reason };
       }
+      if (header.wireFormat !== 'private_message') {
+        this.#halt(seq, 'not a PrivateMessage');
+        return { kind: 'halted', reason: 'not a PrivateMessage' };
+      }
+      if (!bytesEqual(header.groupId, uuidToBytes(this.topicId))) {
+        this.#halt(seq, 'MLS group_id does not match the topic');
+        return { kind: 'halted', reason: 'MLS group_id does not match the topic' };
+      }
+
+      // Our own application generation is already consumed. Another member's
+      // same-epoch application message uses their ratchet, so it is applied on
+      // top of the staged state and the original ciphertext stays staged.
+      const mergeIntoPending =
+        this.#pending?.kind === 'application' && header.contentType === 'application' && header.epoch === this.epoch;
+      const base = mergeIntoPending ? this.engine.deserialize(this.#pending!.mlsState) : this.#confirmed;
 
       let decision: CommitDecision | undefined;
       let result: ProcessResult;
       try {
-        result = await this.engine.process(this.#confirmed, message, (commit) => {
+        result = await this.engine.process(base, message, (commit) => {
           decision = evaluateCommit(commit, this.#policyContext());
           return decision.ok;
         });
       } catch (err) {
-        if (header.contentType !== 'commit') throw err;
-        const reason = err instanceof Error ? err.message : 'commit failed';
+        const reason = err instanceof Error ? err.message : 'message could not be processed';
         this.#halt(seq, reason);
         return { kind: 'halted', reason };
       }
@@ -463,17 +489,33 @@ export class TopicSession {
       if (result.kind === 'application') {
         const envelope = parseEnvelope(result.plaintext);
         const authorMatches = envelope !== null && envelope.author.handle === result.sender.credential.handle;
+        const record = {
+          signatureKey: result.sender.signatureKey,
+          type: envelope && authorMatches ? envelope.type : 'invalid',
+          authorMatches,
+        };
+        if (mergeIntoPending && this.#pending) {
+          const mlsState = this.engine.serialize(result.next);
+          this.store.writeTopic(this.topicId, {
+            mlsState,
+            epoch: this.epoch,
+            lastSeq: seq,
+            status: this.status,
+            clearPending: false,
+            preserveConfirmed: true,
+            message: record,
+          });
+          this.#pending = { ...this.#pending, mlsState, epoch: this.engine.epoch(result.next) };
+          this.lastSeq = seq;
+          return { kind: 'application', sender: result.sender, envelope: authorMatches ? envelope : null, authorMatches };
+        }
         this.store.writeTopic(this.topicId, {
           mlsState: this.engine.serialize(result.next),
           epoch: this.engine.epoch(result.next),
           lastSeq: seq,
           status: this.status,
           clearPending: true,
-          message: {
-            signatureKey: result.sender.signatureKey,
-            type: envelope && authorMatches ? envelope.type : 'invalid',
-            authorMatches,
-          },
+          message: record,
         });
         this.#adopt(result.next, seq, this.status);
         return { kind: 'application', sender: result.sender, envelope: authorMatches ? envelope : null, authorMatches };

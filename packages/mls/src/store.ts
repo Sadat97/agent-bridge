@@ -62,6 +62,12 @@ export interface TopicWrite {
   lastSeq: number;
   status: TopicStatus;
   clearPending: boolean;
+  /**
+   * Keep `topics.mls_state` (the last confirmed state) and store `mlsState`
+   * on the staged outbound row instead. Used when an application ratchet was
+   * already consumed and a same-epoch message has to be merged on top of it.
+   */
+  preserveConfirmed?: boolean;
   message?: { signatureKey: Uint8Array; type: string; authorMatches: boolean };
   approvalIds?: string[];
   pins?: Array<{ handle: string; identityKey: Uint8Array }>;
@@ -275,14 +281,22 @@ export class MlsStore {
       if (write.lastSeq !== lastSeq + 1) {
         throw new MlsOperationError('seq_gap', `topic is at seq ${lastSeq}, cannot write ${write.lastSeq}`);
       }
-      this.#db
-        .prepare(
-          `UPDATE topics
-              SET mls_state = ?, epoch = ?, last_seq = ?, status = ?,
-                  halt_reason = NULL, halt_seq = NULL
-            WHERE topic_id = ?`,
-        )
-        .run(write.mlsState, epochNumber(write.epoch), write.lastSeq, write.status, topicId);
+      if (write.preserveConfirmed) {
+        this.#db.prepare('UPDATE topics SET last_seq = ? WHERE topic_id = ?').run(write.lastSeq, topicId);
+        const pending = this.#db
+          .prepare('UPDATE pending_outbound SET mls_state = ? WHERE topic_id = ?')
+          .run(write.mlsState, topicId);
+        if (pending.changes !== 1) throw new MlsOperationError('mls_error', 'no staged outbound to merge into');
+      } else {
+        this.#db
+          .prepare(
+            `UPDATE topics
+                SET mls_state = ?, epoch = ?, last_seq = ?, status = ?,
+                    halt_reason = NULL, halt_seq = NULL
+              WHERE topic_id = ?`,
+          )
+          .run(write.mlsState, epochNumber(write.epoch), write.lastSeq, write.status, topicId);
+      }
       if (write.message) {
         this.#db
           .prepare(

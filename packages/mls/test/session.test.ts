@@ -1,4 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { uuidToBytes } from '@agent-bridge/protocol';
 import { replenishKeyPackages, TopicSession } from '../src/index.ts';
 import { connected, later, makePerson, reopen, signAdd, signRemove } from './helpers.ts';
 
@@ -70,7 +72,7 @@ describe('multi-member sessions', () => {
   it('hides posting until a joiner accepts, and a gap does not advance state', async () => {
     const bob = makePerson('bob');
     const alice = makePerson('alice');
-    const topicId = (await import('node:crypto')).randomUUID();
+    const topicId = randomUUID();
     const owner = await TopicSession.create({ store: alice.store, engine: alice.engine, topicId, credential: alice.credential });
     const [keyPackage] = await replenishKeyPackages(bob.engine, bob.credential, bob.store, 1);
     const expiresAt = later();
@@ -91,11 +93,76 @@ describe('multi-member sessions', () => {
     await expect(joined.stageMessage({ type: 'update', body: 'too soon' })).rejects.toMatchObject({ code: 'topic_pending_join' });
     const decline = await joined.stageMessage({ type: 'leave' });
     expect(decline.kind).toBe('application');
-    await joined.abortStaged();
+    await expect(joined.abortStaged()).rejects.toMatchObject({ code: 'outbound_pending' });
+    expect(joined.staged()?.message).toEqual(decline.message);
     await joined.acceptJoin();
     expect(joined.status).toBe('active');
 
     await expect(joined.receive(3, decline.message)).rejects.toMatchObject({ code: 'seq_gap' });
     expect(joined.lastSeq).toBe(1);
+  });
+
+  it('keeps a staged application generation when another same-epoch message arrives', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const base = owner.lastSeq;
+    const first = await owner.stageMessage({ type: 'update', body: 'one' });
+    const theirs = await bobSession.stageMessage({ type: 'update', body: 'from bob' });
+    await bobSession.confirmStaged(base + 1);
+    const bobBefore = bob.engine.deserialize(bob.engine.serialize(bobSession.confirmedState()));
+
+    expect((await owner.receive(base + 1, theirs.message)).kind).toBe('application');
+    expect(owner.staged()?.message).toEqual(first.message);
+    expect(owner.lastSeq).toBe(base + 1);
+    await expect(owner.stageMessage({ type: 'update', body: 'two' })).rejects.toMatchObject({ code: 'outbound_pending' });
+    await expect(owner.abortStaged()).rejects.toMatchObject({ code: 'outbound_pending' });
+
+    await owner.confirmStaged(base + 2);
+    const second = await owner.stageMessage({ type: 'update', body: 'two' });
+    const firstRead = await bob.engine.process(bobBefore, first.message, () => true);
+    expect(firstRead.kind).toBe('application');
+    await expect(bob.engine.process(bob.engine.deserialize(bob.engine.serialize(bobBefore)), second.message, () => true)).rejects.toThrow();
+    if (firstRead.kind !== 'application') throw new Error('expected application');
+    const secondRead = await bob.engine.process(firstRead.next, second.message, () => true);
+    expect(secondRead.kind).toBe('application');
+  });
+
+  it('halts on an application message that cannot be decrypted, and refuses a Welcome for another group', async () => {
+    const bob = makePerson('bob');
+    const { owner, session, topicId } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const epoch = bobSession.epoch;
+    const before = bob.engine.serialize(bobSession.confirmedState());
+    const good = await owner.stageMessage({ type: 'update', body: 'intact' });
+    await owner.confirmStaged(owner.lastSeq + 1);
+    const broken = good.message.slice();
+    broken[broken.length - 1] = broken[broken.length - 1]! ^ 0xff;
+    expect(await bobSession.receive(bobSession.lastSeq + 1, broken)).toMatchObject({ kind: 'halted' });
+    expect(bobSession.status).toBe('halted');
+    expect(bobSession.epoch).toBe(epoch);
+    expect(bob.engine.serialize(bobSession.confirmedState())).toEqual(before);
+    await expect(bobSession.stageMessage({ type: 'update', body: 'nope' })).rejects.toMatchObject({ code: 'topic_halted' });
+  });
+
+  it('does not consume a KeyPackage when the Welcome belongs to another group', async () => {
+    const alice = makePerson('alice');
+    const bob = makePerson('bob');
+    const [pack] = await replenishKeyPackages(bob.engine, bob.credential, bob.store, 1);
+    const stored = bob.store.keyPackages(0).length;
+    const state = await alice.engine.createGroup(uuidToBytes(randomUUID()), alice.credential);
+    const added = await alice.engine.commit(state, { adds: [pack!], authenticatedData: new Uint8Array() });
+    await expect(
+      TopicSession.join({
+        store: bob.store,
+        engine: bob.engine,
+        topicId: randomUUID(),
+        welcome: added.welcome!,
+        credential: bob.credential,
+        ownerIdentityKey: alice.identity.publicKey,
+        commitSeq: 1,
+      }),
+    ).rejects.toThrow(/group_id/);
+    expect(bob.store.keyPackages(0).length).toBe(stored);
   });
 });
