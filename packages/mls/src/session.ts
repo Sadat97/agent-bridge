@@ -26,6 +26,7 @@ import type { Envelope, MessageType } from './envelope.ts';
 import { MlsOperationError } from './errors.ts';
 import { readKeyPackage } from './key-package.ts';
 import { MlsStore } from './store.ts';
+import { UNPUBLISHED_GENERATION_SKIP } from './ts-mls-engine.ts';
 import type { IdentityPin, PendingRow, TopicRole, TopicStatus } from './store.ts';
 import type { CommitInspection, Credential, GroupState, Member, MlsEngine, ProcessResult } from './types.ts';
 
@@ -119,6 +120,8 @@ export class TopicSession {
   readonly #ownerIdentityKey: Uint8Array;
   #confirmed: GroupState;
   #pending: Pending | undefined;
+  #applicationDiscards: number;
+  #handshakeDiscards: number;
   #queue: Promise<void> = Promise.resolve();
 
   private constructor(init: {
@@ -135,6 +138,8 @@ export class TopicSession {
     ownerIdentityKey: Uint8Array;
     confirmed: GroupState;
     pending?: Pending;
+    applicationDiscards: number;
+    handshakeDiscards: number;
   }) {
     this.store = init.store;
     this.engine = init.engine;
@@ -149,6 +154,8 @@ export class TopicSession {
     this.#ownerIdentityKey = init.ownerIdentityKey;
     this.#confirmed = init.confirmed;
     this.#pending = init.pending;
+    this.#applicationDiscards = init.applicationDiscards;
+    this.#handshakeDiscards = init.handshakeDiscards;
   }
 
   static async create(opts: {
@@ -263,6 +270,8 @@ export class TopicSession {
       devicePublicKey: row.devicePublicKey,
       ownerIdentityKey: row.ownerIdentityKey,
       confirmed,
+      applicationDiscards: row.applicationDiscards,
+      handshakeDiscards: row.handshakeDiscards,
       ...(pendingRow ? { pending: decodePending(engine, pendingRow) } : {}),
     });
   }
@@ -424,19 +433,32 @@ export class TopicSession {
       if (this.#pending.kind === 'application') {
         // The ciphertext may be dropped. The generation it consumed is not:
         // the next encrypt starts from this state, so it is a new generation.
-        // Peers who never saw the ciphertext skip that generation.
+        // Peers who never saw the ciphertext skip that generation. One more
+        // than UNPUBLISHED_GENERATION_SKIP would be a seq they cannot apply.
+        this.#refuseIfDiscardsFull(this.#applicationDiscards);
         const next = this.engine.deserialize(this.#pending.mlsState);
-        this.store.keepRatchet(this.topicId, this.#pending.mlsState, this.engine.epoch(next));
+        const applicationDiscards = this.#applicationDiscards + 1;
+        this.store.keepRatchet(this.topicId, this.#pending.mlsState, this.engine.epoch(next), {
+          application: applicationDiscards,
+          handshake: this.#handshakeDiscards,
+        });
         this.#confirmed = next;
         this.epoch = this.engine.epoch(next);
+        this.#applicationDiscards = applicationDiscards;
         this.#pending = undefined;
         return;
       }
       // The pending commit state is already the next epoch. Keeping it would
       // desynchronize us from peers. Burn one handshake generation in this
       // epoch instead, so the rebuilt commit does not reuse it.
+      this.#refuseIfDiscardsFull(this.#handshakeDiscards);
       const burned = await this.engine.discardHandshakeGeneration(this.#confirmed);
-      this.store.keepRatchet(this.topicId, this.engine.serialize(burned), this.engine.epoch(burned));
+      const handshakeDiscards = this.#handshakeDiscards + 1;
+      this.store.keepRatchet(this.topicId, this.engine.serialize(burned), this.engine.epoch(burned), {
+        application: this.#applicationDiscards,
+        handshake: handshakeDiscards,
+      });
+      this.#handshakeDiscards = handshakeDiscards;
       this.#confirmed = burned;
       this.epoch = this.engine.epoch(burned);
       this.#pending = undefined;
@@ -487,9 +509,8 @@ export class TopicSession {
         });
       } catch (err) {
         const reason = err instanceof Error ? err.message : 'message could not be processed';
-        // A gap larger than UNPUBLISHED_GENERATION_SKIP is not a bad frame and
-        // not a commit the group cannot follow. Leave the topic active.
-        if (/too far in the future/i.test(reason)) throw err;
+        // Includes a forward skip past UNPUBLISHED_GENERATION_SKIP. That seq
+        // cannot be skipped, so the topic halts the same way a bad frame does.
         this.#halt(seq, reason);
         return { kind: 'halted', reason };
       }
@@ -547,7 +568,11 @@ export class TopicSession {
         message: { signatureKey: result.committer.signatureKey, type: 'commit', authorMatches: true },
         approvalIds: decision.approvalIds,
         pins: decision.pins,
+        applicationDiscards: 0,
+        handshakeDiscards: 0,
       });
+      this.#applicationDiscards = 0;
+      this.#handshakeDiscards = 0;
       this.#adopt(result.next, seq, status);
       return { kind: 'commit', committer: result.committer, added: result.added, removed: result.removed };
     });
@@ -573,6 +598,7 @@ export class TopicSession {
     if (seq !== this.lastSeq + 1) throw new MlsOperationError('seq_gap', `expected seq ${this.lastSeq + 1}, got ${seq}`);
     const next = this.engine.deserialize(pending.mlsState);
     const envelope = pending.envelope;
+    const freshEpoch = pending.kind === 'commit';
     this.store.writeTopic(this.topicId, {
       mlsState: pending.mlsState,
       epoch: this.engine.epoch(next),
@@ -586,8 +612,20 @@ export class TopicSession {
       },
       approvalIds: pending.approvalIds,
       pins: pending.pins,
+      applicationDiscards: 0,
+      handshakeDiscards: freshEpoch ? 0 : this.#handshakeDiscards,
     });
+    this.#applicationDiscards = 0;
+    if (freshEpoch) this.#handshakeDiscards = 0;
     this.#adopt(next, seq, this.status);
+  }
+
+  #refuseIfDiscardsFull(discards: number): void {
+    if (discards < UNPUBLISHED_GENERATION_SKIP) return;
+    throw new MlsOperationError(
+      'skip_limit',
+      'discarding this draft would leave a gap peers cannot skip; send it so they can catch up',
+    );
   }
 
   #halt(seq: number, reason: string): void {
