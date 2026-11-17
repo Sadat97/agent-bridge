@@ -8,10 +8,18 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue } from 'node:sqlite';
-import { bytesEqual } from '@agent-bridge/protocol';
+import { bytesEqual, toBase64, utf8 } from '@agent-bridge/protocol';
 import { MlsOperationError } from './errors.ts';
 
-export type TopicStatus = 'active' | 'pending_join' | 'halted' | 'left';
+/** AES-256-GCM (or another AEAD) supplied by the bridge. Absent in unit tests. */
+export interface SecretSealer {
+  seal(plaintext: Uint8Array, aad: Uint8Array): Uint8Array;
+  open(sealed: Uint8Array, aad: Uint8Array): Uint8Array;
+}
+
+export type StoreDb = DatabaseSync;
+
+export type TopicStatus = 'active' | 'pending_join' | 'halted' | 'left' | 'stale' | 'closed';
 export type TopicRole = 'owner' | 'member';
 
 export interface TopicRow {
@@ -27,6 +35,10 @@ export interface TopicRow {
   lastSeq: number;
   haltReason: string | null;
   haltSeq: number | null;
+  /** Application generations aborted in this epoch and not yet covered by a sent message. */
+  unpublishedApplication: number;
+  /** Handshake generations aborted in this epoch. A commit moves the epoch and clears both. */
+  unpublishedHandshake: number;
 }
 
 export interface NewTopic {
@@ -71,6 +83,9 @@ export interface TopicWrite {
   message?: { signatureKey: Uint8Array; type: string; authorMatches: boolean };
   approvalIds?: string[];
   pins?: Array<{ handle: string; identityKey: Uint8Array }>;
+  /** When set, replace the stored unpublished-generation counters. Null leaves them. */
+  unpublishedApplication?: number;
+  unpublishedHandshake?: number;
 }
 
 export interface IdentityPin {
@@ -95,7 +110,9 @@ CREATE TABLE IF NOT EXISTS topics (
   epoch INTEGER NOT NULL,
   last_seq INTEGER NOT NULL,
   halt_reason TEXT,
-  halt_seq INTEGER
+  halt_seq INTEGER,
+  unpublished_application INTEGER NOT NULL DEFAULT 0,
+  unpublished_handshake INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
   topic_id TEXT NOT NULL,
@@ -130,12 +147,16 @@ export class MlsStore {
   /** Live pin map. Updated only after a transaction commits. */
   readonly pins = new Map<string, Uint8Array>();
   readonly #db: DatabaseSync;
+  readonly #sealer: SecretSealer | undefined;
 
-  constructor(path: string) {
+  constructor(path: string, options?: { sealer?: SecretSealer }) {
+    this.#sealer = options?.sealer;
     this.#db = new DatabaseSync(path);
     this.#db.prepare('PRAGMA journal_mode = WAL').get();
     this.#db.exec('PRAGMA synchronous = FULL');
+    this.#db.exec('PRAGMA busy_timeout = 1000');
     this.#db.exec(SCHEMA);
+    this.#ensureRatchetColumns();
     for (const row of this.#db.prepare('SELECT handle, identity_pubkey FROM contacts').all()) {
       this.pins.set(text(row.handle, 'handle'), blob(row.identity_pubkey, 'identity_pubkey'));
     }
@@ -175,7 +196,7 @@ export class MlsStore {
           topic.devicePublicKey,
           topic.ownerIdentityKey,
           topic.engineId,
-          topic.mlsState,
+          this.#seal(topic.mlsState, `topic-mls:${topic.topicId}`),
           epochNumber(topic.epoch),
           topic.lastSeq,
         );
@@ -187,6 +208,13 @@ export class MlsStore {
       }
     });
     for (const pin of remembered) this.pins.set(pin.handle, pin.identityKey.slice());
+  }
+
+  topicIds(): string[] {
+    return this.#db
+      .prepare('SELECT topic_id FROM topics')
+      .all()
+      .map((row) => text(row.topic_id, 'topic_id'));
   }
 
   topic(topicId: string): TopicRow | undefined {
@@ -203,11 +231,13 @@ export class MlsStore {
       devicePublicKey: blob(row.device_public_key, 'device_public_key'),
       ownerIdentityKey: blob(row.owner_identity_key, 'owner_identity_key'),
       engineId: text(row.mls_engine, 'mls_engine'),
-      mlsState: blob(row.mls_state, 'mls_state'),
+      mlsState: this.#open(blob(row.mls_state, 'mls_state'), `topic-mls:${topicId}`),
       epoch: BigInt(integer(row.epoch, 'epoch')),
       lastSeq: integer(row.last_seq, 'last_seq'),
       haltReason: row.halt_reason === null ? null : text(row.halt_reason, 'halt_reason'),
       haltSeq: row.halt_seq === null ? null : integer(row.halt_seq, 'halt_seq'),
+      unpublishedApplication: integer(row.unpublished_application, 'unpublished_application'),
+      unpublishedHandshake: integer(row.unpublished_handshake, 'unpublished_handshake'),
     };
   }
 
@@ -247,7 +277,7 @@ export class MlsStore {
     return {
       message: blob(row.message, 'message'),
       welcome: row.welcome === null ? null : blob(row.welcome, 'welcome'),
-      mlsState: blob(row.mls_state, 'mls_state'),
+      mlsState: this.#open(blob(row.mls_state, 'mls_state'), `pending-mls:${topicId}`),
       manifestJson: text(row.manifest_json, 'manifest_json'),
     };
   }
@@ -258,7 +288,7 @@ export class MlsStore {
       if (existing) throw new MlsOperationError('outbound_pending', 'an outbound message is already staged');
       this.#db
         .prepare('INSERT INTO pending_outbound (topic_id, message, welcome, mls_state, manifest_json) VALUES (?, ?, ?, ?, ?)')
-        .run(topicId, row.message, row.welcome, row.mlsState, row.manifestJson);
+        .run(topicId, row.message, row.welcome, this.#seal(row.mlsState, `pending-mls:${topicId}`), row.manifestJson);
     });
   }
 
@@ -266,11 +296,26 @@ export class MlsStore {
    * The staged ciphertext is being discarded, but the ratchet generation it
    * consumed stays consumed. The next encrypt continues from `mlsState`.
    */
-  keepRatchet(topicId: string, mlsState: Uint8Array, epoch: bigint): void {
+  keepRatchet(
+    topicId: string,
+    mlsState: Uint8Array,
+    epoch: bigint,
+    unpublished: { application: number; handshake: number },
+  ): void {
     this.transaction(() => {
       const result = this.#db
-        .prepare('UPDATE topics SET mls_state = ?, epoch = ? WHERE topic_id = ?')
-        .run(mlsState, epochNumber(epoch), topicId);
+        .prepare(
+          `UPDATE topics
+              SET mls_state = ?, epoch = ?, unpublished_application = ?, unpublished_handshake = ?
+            WHERE topic_id = ?`,
+        )
+        .run(
+          this.#seal(mlsState, `topic-mls:${topicId}`),
+          epochNumber(epoch),
+          unpublished.application,
+          unpublished.handshake,
+          topicId,
+        );
       if (result.changes !== 1) throw new MlsOperationError('not_found', 'no such topic');
       this.#db.prepare('DELETE FROM pending_outbound WHERE topic_id = ?').run(topicId);
     });
@@ -286,7 +331,7 @@ export class MlsStore {
    * Advance a topic by one seq. The previous last_seq must be `write.lastSeq - 1`,
    * so a replay or a gap rolls the whole write back.
    */
-  writeTopic(topicId: string, write: TopicWrite): IdentityPin[] {
+  writeTopic(topicId: string, write: TopicWrite, side?: (db: StoreDb) => void): IdentityPin[] {
     const remembered: IdentityPin[] = [];
     this.transaction(() => {
       const current = this.#db.prepare('SELECT last_seq FROM topics WHERE topic_id = ?').get(topicId);
@@ -299,17 +344,27 @@ export class MlsStore {
         this.#db.prepare('UPDATE topics SET last_seq = ? WHERE topic_id = ?').run(write.lastSeq, topicId);
         const pending = this.#db
           .prepare('UPDATE pending_outbound SET mls_state = ? WHERE topic_id = ?')
-          .run(write.mlsState, topicId);
+          .run(this.#seal(write.mlsState, `pending-mls:${topicId}`), topicId);
         if (pending.changes !== 1) throw new MlsOperationError('mls_error', 'no staged outbound to merge into');
       } else {
         this.#db
           .prepare(
             `UPDATE topics
                 SET mls_state = ?, epoch = ?, last_seq = ?, status = ?,
-                    halt_reason = NULL, halt_seq = NULL
+                    halt_reason = NULL, halt_seq = NULL,
+                    unpublished_application = COALESCE(?, unpublished_application),
+                    unpublished_handshake = COALESCE(?, unpublished_handshake)
               WHERE topic_id = ?`,
           )
-          .run(write.mlsState, epochNumber(write.epoch), write.lastSeq, write.status, topicId);
+          .run(
+            this.#seal(write.mlsState, `topic-mls:${topicId}`),
+            epochNumber(write.epoch),
+            write.lastSeq,
+            write.status,
+            write.unpublishedApplication ?? null,
+            write.unpublishedHandshake ?? null,
+            topicId,
+          );
       }
       if (write.message) {
         this.#db
@@ -327,6 +382,7 @@ export class MlsStore {
         if (this.#insertPin(pin)) remembered.push(pin);
       }
       if (write.clearPending) this.#db.prepare('DELETE FROM pending_outbound WHERE topic_id = ?').run(topicId);
+      side?.(this.#db);
     });
     for (const pin of remembered) this.pins.set(pin.handle, pin.identityKey.slice());
     return remembered;
@@ -353,7 +409,7 @@ export class MlsStore {
           `INSERT INTO key_packages (key_package_ref, private_package, expires_at) VALUES (?, ?, ?)
            ON CONFLICT (key_package_ref) DO NOTHING`,
         )
-        .run(ref, privatePackage, expiresAt);
+        .run(ref, this.#seal(privatePackage, `key-package:${toBase64(ref)}`), expiresAt);
     });
   }
 
@@ -363,8 +419,40 @@ export class MlsStore {
       .all(nowSeconds)
       .map((row) => ({
         ref: blob(row.key_package_ref, 'key_package_ref'),
-        privatePackage: blob(row.private_package, 'private_package'),
+        privatePackage: this.#open(
+          blob(row.private_package, 'private_package'),
+          `key-package:${toBase64(blob(row.key_package_ref, 'key_package_ref'))}`,
+        ),
       }));
+  }
+
+  #ensureRatchetColumns(): void {
+    const names = new Set(
+      this.#db
+        .prepare('PRAGMA table_info(topics)')
+        .all()
+        .map((row) => text(row.name, 'name')),
+    );
+    if (!names.has('unpublished_application')) {
+      this.#db.exec('ALTER TABLE topics ADD COLUMN unpublished_application INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!names.has('unpublished_handshake')) {
+      this.#db.exec('ALTER TABLE topics ADD COLUMN unpublished_handshake INTEGER NOT NULL DEFAULT 0');
+    }
+  }
+
+  #seal(plain: Uint8Array, aad: string): Uint8Array {
+    return this.#sealer ? this.#sealer.seal(plain, utf8(aad)) : plain;
+  }
+
+  #open(stored: Uint8Array, aad: string): Uint8Array {
+    if (!this.#sealer) return stored;
+    try {
+      return this.#sealer.open(stored, utf8(aad));
+    } catch (err) {
+      if (err instanceof MlsOperationError) throw err;
+      throw new MlsOperationError('mls_error', 'stored secret could not be opened');
+    }
   }
 
   /** Insert a pin or accept the same key. Throws, without writing, when the key differs. */
@@ -406,7 +494,14 @@ function integer(value: SQLOutputValue | undefined, label: string): number {
 }
 
 function isStatus(value: string): value is TopicStatus {
-  return value === 'active' || value === 'pending_join' || value === 'halted' || value === 'left';
+  return (
+    value === 'active' ||
+    value === 'pending_join' ||
+    value === 'halted' ||
+    value === 'left' ||
+    value === 'stale' ||
+    value === 'closed'
+  );
 }
 
 function isRole(value: string): value is TopicRole {

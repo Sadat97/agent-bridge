@@ -1,0 +1,19 @@
+{
+  "name": "@agent-bridge/bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Bridge daemon: MLS, policy, and the local MCP, REST, and CLI agent surface.",
+  "bin": {
+    "agb": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agent-bridge/mls": "0.1.0",
+    "@agent-bridge/protocol": "0.1.0",
+    "@noble/hashes": "2.3.0",
+    "ws": "8.23.0"
+  }
+}

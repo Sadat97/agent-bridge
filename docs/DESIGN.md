@@ -575,6 +575,8 @@ Added during implementation (milestone 2): `auth_challenges` (single-use login n
 
 Path: `~/.agent-bridge/store.sqlite`. Keys and MLS state are wrapped at the application level (AES-256-GCM). Message and state plaintext rely on OS disk encryption in MVP; SQLCipher is a later option.
 
+**At-rest wrapping.** `storage.key` (mode 0600) is 32 random bytes. It seals the device private key, every saved MLS state (confirmed and staged), and KeyPackage private material with AES-256-GCM. Associated data binds each ciphertext to its row. The identity private key is not under that key: a passphrase is stretched with Argon2id (time 2, memory 19 MiB, parallelism 1) and the seed is sealed with a fresh salt and nonce, then zeroed after the one approval that opened it. Copying `store.sqlite` without `storage.key` does not yield those secrets.
+
 ```sql
 CREATE TABLE identity (
   handle            TEXT PRIMARY KEY,
@@ -891,6 +893,8 @@ struct {
 
 If ts-mls throws while processing a commit (decryption or MLS validation failure), the bridge halts the same way, because a commit cannot be skipped. Recovery is a new topic created by the topic owner without the offending member. A malicious member can therefore force a halt (denial of service) but cannot add or remove anyone.
 
+Engine and library failures are stored as stable reason codes (`generation_gap`, `generation_past`, `epoch_too_old`, `undecryptable`, `truncated`, `bad_frame`, `unsupported_proposal`, `invalid_credential`, `mls_rejected`, `mls_error`), not as the library's own sentence. A gap larger than the unpublished-generation cap (32) is `generation_gap` and halts the topic, because the relay will not skip that seq. A sender that would discard another unpublished draft past that cap refuses with `self_update_required` and commits a self-update before discarding more. Application and handshake ratchets are counted separately; a self-update after only application drafts still uses handshake generation 0.
+
 ```mermaid
 flowchart TD
   In["Next commit in seq order"] --> Proc["MlsEngine.process: ts-mls decrypts,<br/>then calls the validation callback"]
@@ -1022,7 +1026,7 @@ sequenceDiagram
   BB-->>Ag2: The request, with approval signed
 ```
 
-Errors use one shape: `{ "error": "not_found | unauthorized | out_of_scope | invalid_patch | topic_halted | topic_pending_join | mls_error | relay_unavailable", "message": "…", "details": {} }`. `conflict` and `pending_approval` are normal results, not errors.
+Errors use one shape: `{ "error": "not_found | unauthorized | out_of_scope | invalid_patch | topic_halted | topic_pending_join | self_update_required | mls_error | relay_unavailable", "message": "…", "details": {} }`. `conflict` and `pending_approval` are normal results, not errors. A halted topic's `message` is the stable reason text, not a library sentence.
 
 ### 6.2 MCP tools
 

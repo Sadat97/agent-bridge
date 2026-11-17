@@ -154,18 +154,115 @@ describe('multi-member sessions', () => {
     expect(bobSession.status).toBe('halted');
   });
 
-  it('does not halt when a sender skips more unpublished generations than the cap', async () => {
+  it('refuses to discard an application draft past the unpublished cap, and a self-update clears it', async () => {
     const bob = makePerson('bob');
     const { owner, session } = await connected([bob]);
     const bobSession = session.get(bob)!;
-    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP + 1; i++) {
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
       await owner.stageMessage({ type: 'update', body: `draft ${i}` });
       await owner.abortStaged();
     }
-    const beyond = await owner.stageMessage({ type: 'update', body: 'beyond' });
+    expect(owner.unpublishedApplication).toBe(UNPUBLISHED_GENERATION_SKIP);
+    const atCap = await owner.stageMessage({ type: 'update', body: 'still reachable' });
+    await expect(owner.abortStaged()).rejects.toMatchObject({ code: 'self_update_required' });
+    expect(owner.staged()?.message).toEqual(atCap.message);
+    expect(owner.status).toBe('active');
+    expect(owner.unpublishedApplication).toBe(UNPUBLISHED_GENERATION_SKIP);
+
     await owner.confirmStaged(owner.lastSeq + 1);
-    await expect(bobSession.receive(bobSession.lastSeq + 1, beyond.message)).rejects.toThrow(/too far in the future/);
+    const read = await bobSession.receive(bobSession.lastSeq + 1, atCap.message);
+    expect(read).toMatchObject({ kind: 'application', envelope: { body: 'still reachable' } });
     expect(bobSession.status).toBe('active');
+
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
+      await owner.stageMessage({ type: 'update', body: `again ${i}` });
+      await owner.abortStaged();
+    }
+    const update = await owner.stageCommit();
+    await owner.confirmStaged(owner.lastSeq + 1);
+    const committed = await bobSession.receive(bobSession.lastSeq + 1, update.message);
+    expect(committed.kind).toBe('commit');
+    expect(bobSession.status).toBe('active');
+    expect(owner.unpublishedApplication).toBe(0);
+    expect(owner.unpublishedHandshake).toBe(0);
+    await owner.stageMessage({ type: 'update', body: 'after the epoch' });
+    await owner.abortStaged();
+    expect(owner.staged()).toBeUndefined();
+    expect(owner.status).toBe('active');
+  });
+
+  it('refuses to discard a handshake draft past the cap, and the commit at the cap still applies', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const epoch = bobSession.epoch;
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
+      await owner.stageCommit();
+      await owner.abortStaged();
+    }
+    expect(owner.unpublishedHandshake).toBe(UNPUBLISHED_GENERATION_SKIP);
+    const atCap = await owner.stageCommit();
+    await expect(owner.abortStaged()).rejects.toMatchObject({ code: 'self_update_required' });
+    expect(owner.staged()?.message).toEqual(atCap.message);
+    expect(owner.status).toBe('active');
+    await owner.confirmStaged(owner.lastSeq + 1);
+    const read = await bobSession.receive(bobSession.lastSeq + 1, atCap.message);
+    expect(read.kind).toBe('commit');
+    expect(bobSession.status).toBe('active');
+    expect(bobSession.epoch).toBe(epoch + 1n);
+  });
+
+  it('halts when a peer is shown an application generation past the cap', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const before = bob.engine.serialize(bobSession.confirmedState());
+    let state = owner.engine.deserialize(owner.engine.serialize(owner.confirmedState()));
+    let message: Uint8Array = new Uint8Array();
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP + 2; i++) {
+      const encrypted = await owner.engine.encrypt(state, new TextEncoder().encode(`{"v":1,"i":${i}}`));
+      state = encrypted.next;
+      message = encrypted.message;
+    }
+    const halted = await bobSession.receive(bobSession.lastSeq + 1, message);
+    expect(halted).toEqual({ kind: 'halted', reason: 'generation_gap' });
+    expect(bobSession.status).toBe('halted');
+    expect(bobSession.haltReason).toBe('generation_gap');
+    expect(bob.engine.serialize(bobSession.confirmedState())).toEqual(before);
+    const again = await bobSession.receive(bobSession.lastSeq + 1, message);
+    expect(again).toEqual({ kind: 'halted', reason: 'generation_gap' });
+    await expect(bobSession.stageMessage({ type: 'update', body: 'nope' })).rejects.toMatchObject({ code: 'topic_halted' });
+  });
+
+  it('halts when a peer is shown a handshake generation past the cap', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const seq = bobSession.lastSeq;
+    let state = owner.engine.deserialize(owner.engine.serialize(owner.confirmedState()));
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP + 1; i++) {
+      state = await owner.engine.discardHandshakeGeneration(state);
+    }
+    const committed = await owner.engine.commit(state, { authenticatedData: new Uint8Array() });
+    const halted = await bobSession.receive(seq + 1, committed.commit);
+    expect(halted).toEqual({ kind: 'halted', reason: 'generation_gap' });
+    expect(bobSession.status).toBe('halted');
+    expect(bobSession.lastSeq).toBe(seq);
+  });
+
+  it('remembers the unpublished count across a restart', async () => {
+    const bob = makePerson('bob');
+    const { alice, topicId, owner } = await connected([bob]);
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
+      await owner.stageMessage({ type: 'update', body: `draft ${i}` });
+      await owner.abortStaged();
+    }
+    const restarted = reopen(alice, topicId);
+    expect(restarted.unpublishedApplication).toBe(UNPUBLISHED_GENERATION_SKIP);
+    await restarted.stageMessage({ type: 'update', body: 'held' });
+    await expect(restarted.abortStaged()).rejects.toMatchObject({ code: 'self_update_required' });
+    expect(restarted.staged()).toBeDefined();
+    expect(restarted.status).toBe('active');
   });
 
   it('does not halt the owner when a joiner aborts a leave and then posts', async () => {
