@@ -154,18 +154,86 @@ describe('multi-member sessions', () => {
     expect(bobSession.status).toBe('halted');
   });
 
-  it('does not halt when a sender skips more unpublished generations than the cap', async () => {
+  it('refuses an abort past the skip cap and still delivers that draft', async () => {
     const bob = makePerson('bob');
-    const { owner, session } = await connected([bob]);
+    const { alice, topicId, owner, session } = await connected([bob]);
     const bobSession = session.get(bob)!;
-    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP + 1; i++) {
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
       await owner.stageMessage({ type: 'update', body: `draft ${i}` });
       await owner.abortStaged();
     }
-    const beyond = await owner.stageMessage({ type: 'update', body: 'beyond' });
-    await owner.confirmStaged(owner.lastSeq + 1);
-    await expect(bobSession.receive(bobSession.lastSeq + 1, beyond.message)).rejects.toThrow(/too far in the future/);
+    const reopened = reopen(alice, topicId);
+    const held = await reopened.stageMessage({ type: 'update', body: 'still in range' });
+    await expect(reopened.abortStaged()).rejects.toMatchObject({ code: 'skip_limit' });
+    expect(reopened.staged()?.message).toEqual(held.message);
+    expect(reopened.status).toBe('active');
+    await reopened.confirmStaged(reopened.lastSeq + 1);
+    const read = await bobSession.receive(bobSession.lastSeq + 1, held.message);
+    expect(read).toMatchObject({ kind: 'application', envelope: { body: 'still in range' } });
     expect(bobSession.status).toBe('active');
+    await reopened.stageMessage({ type: 'update', body: 'caught up' });
+    await reopened.abortStaged();
+  });
+
+  it('resets discarded application generations with a self-update', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
+      await owner.stageMessage({ type: 'update', body: `draft ${i}` });
+      await owner.abortStaged();
+    }
+    const epoch = owner.epoch;
+    const update = await owner.stageCommit();
+    await owner.confirmStaged(owner.lastSeq + 1);
+    const committed = await bobSession.receive(bobSession.lastSeq + 1, update.message);
+    expect(committed.kind).toBe('commit');
+    expect(bobSession.status).toBe('active');
+    expect(bobSession.epoch).toBe(epoch + 1n);
+    await owner.stageMessage({ type: 'update', body: 'after epoch' });
+    await owner.abortStaged();
+    const next = await owner.stageMessage({ type: 'update', body: 'fresh' });
+    await owner.confirmStaged(owner.lastSeq + 1);
+    const after = await bobSession.receive(bobSession.lastSeq + 1, next.message);
+    expect(after).toMatchObject({ kind: 'application', envelope: { body: 'fresh' } });
+    expect(bobSession.status).toBe('active');
+  });
+
+  it('refuses a commit abort past the skip cap and still accepts that commit', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const epoch = bobSession.epoch;
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP; i++) {
+      await owner.stageCommit();
+      await owner.abortStaged();
+    }
+    const held = await owner.stageCommit();
+    await expect(owner.abortStaged()).rejects.toMatchObject({ code: 'skip_limit' });
+    expect(owner.staged()?.message).toEqual(held.message);
+    expect(owner.epoch).toBe(epoch);
+    await owner.confirmStaged(owner.lastSeq + 1);
+    const read = await bobSession.receive(bobSession.lastSeq + 1, held.message);
+    expect(read.kind).toBe('commit');
+    expect(bobSession.status).toBe('active');
+    expect(bobSession.epoch).toBe(epoch + 1n);
+  });
+
+  it('halts when an application generation is further ahead than the skip cap', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const before = bob.engine.serialize(bobSession.confirmedState());
+    let state = owner.engine.deserialize(owner.engine.serialize(owner.confirmedState()));
+    for (let i = 0; i < UNPUBLISHED_GENERATION_SKIP + 1; i++) {
+      state = (await owner.engine.encrypt(state, new Uint8Array([1]))).next;
+    }
+    const beyond = await owner.engine.encrypt(state, new Uint8Array([1]));
+    const halted = await bobSession.receive(bobSession.lastSeq + 1, beyond.message);
+    expect(halted).toMatchObject({ kind: 'halted', reason: expect.stringMatching(/too far in the future/) });
+    expect(bobSession.status).toBe('halted');
+    expect(bob.engine.serialize(bobSession.confirmedState())).toEqual(before);
+    await expect(bobSession.stageMessage({ type: 'update', body: 'after' })).rejects.toMatchObject({ code: 'topic_halted' });
   });
 
   it('does not halt the owner when a joiner aborts a leave and then posts', async () => {

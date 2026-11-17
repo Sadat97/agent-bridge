@@ -27,6 +27,10 @@ export interface TopicRow {
   lastSeq: number;
   haltReason: string | null;
   haltSeq: number | null;
+  /** Application generations burned by abort since peers last caught up. */
+  applicationDiscards: number;
+  /** Handshake generations burned by aborting a commit in this epoch. */
+  handshakeDiscards: number;
 }
 
 export interface NewTopic {
@@ -71,6 +75,10 @@ export interface TopicWrite {
   message?: { signatureKey: Uint8Array; type: string; authorMatches: boolean };
   approvalIds?: string[];
   pins?: Array<{ handle: string; identityKey: Uint8Array }>;
+  /** Unpublished application drafts peers still have to skip. */
+  applicationDiscards?: number;
+  /** Unpublished handshake drafts peers still have to skip. */
+  handshakeDiscards?: number;
 }
 
 export interface IdentityPin {
@@ -95,7 +103,9 @@ CREATE TABLE IF NOT EXISTS topics (
   epoch INTEGER NOT NULL,
   last_seq INTEGER NOT NULL,
   halt_reason TEXT,
-  halt_seq INTEGER
+  halt_seq INTEGER,
+  app_discards INTEGER NOT NULL DEFAULT 0,
+  hs_discards INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
   topic_id TEXT NOT NULL,
@@ -136,6 +146,8 @@ export class MlsStore {
     this.#db.prepare('PRAGMA journal_mode = WAL').get();
     this.#db.exec('PRAGMA synchronous = FULL');
     this.#db.exec(SCHEMA);
+    this.#addColumn('topics', 'app_discards', 'INTEGER NOT NULL DEFAULT 0');
+    this.#addColumn('topics', 'hs_discards', 'INTEGER NOT NULL DEFAULT 0');
     for (const row of this.#db.prepare('SELECT handle, identity_pubkey FROM contacts').all()) {
       this.pins.set(text(row.handle, 'handle'), blob(row.identity_pubkey, 'identity_pubkey'));
     }
@@ -208,6 +220,8 @@ export class MlsStore {
       lastSeq: integer(row.last_seq, 'last_seq'),
       haltReason: row.halt_reason === null ? null : text(row.halt_reason, 'halt_reason'),
       haltSeq: row.halt_seq === null ? null : integer(row.halt_seq, 'halt_seq'),
+      applicationDiscards: integer(row.app_discards, 'app_discards'),
+      handshakeDiscards: integer(row.hs_discards, 'hs_discards'),
     };
   }
 
@@ -266,11 +280,16 @@ export class MlsStore {
    * The staged ciphertext is being discarded, but the ratchet generation it
    * consumed stays consumed. The next encrypt continues from `mlsState`.
    */
-  keepRatchet(topicId: string, mlsState: Uint8Array, epoch: bigint): void {
+  keepRatchet(
+    topicId: string,
+    mlsState: Uint8Array,
+    epoch: bigint,
+    discards: { application: number; handshake: number },
+  ): void {
     this.transaction(() => {
       const result = this.#db
-        .prepare('UPDATE topics SET mls_state = ?, epoch = ? WHERE topic_id = ?')
-        .run(mlsState, epochNumber(epoch), topicId);
+        .prepare('UPDATE topics SET mls_state = ?, epoch = ?, app_discards = ?, hs_discards = ? WHERE topic_id = ?')
+        .run(mlsState, epochNumber(epoch), discards.application, discards.handshake, topicId);
       if (result.changes !== 1) throw new MlsOperationError('not_found', 'no such topic');
       this.#db.prepare('DELETE FROM pending_outbound WHERE topic_id = ?').run(topicId);
     });
@@ -306,10 +325,20 @@ export class MlsStore {
           .prepare(
             `UPDATE topics
                 SET mls_state = ?, epoch = ?, last_seq = ?, status = ?,
-                    halt_reason = NULL, halt_seq = NULL
+                    halt_reason = NULL, halt_seq = NULL,
+                    app_discards = COALESCE(?, app_discards),
+                    hs_discards = COALESCE(?, hs_discards)
               WHERE topic_id = ?`,
           )
-          .run(write.mlsState, epochNumber(write.epoch), write.lastSeq, write.status, topicId);
+          .run(
+            write.mlsState,
+            epochNumber(write.epoch),
+            write.lastSeq,
+            write.status,
+            write.applicationDiscards ?? null,
+            write.handshakeDiscards ?? null,
+            topicId,
+          );
       }
       if (write.message) {
         this.#db
@@ -365,6 +394,14 @@ export class MlsStore {
         ref: blob(row.key_package_ref, 'key_package_ref'),
         privatePackage: blob(row.private_package, 'private_package'),
       }));
+  }
+
+  #addColumn(table: string, column: string, definition: string): void {
+    const present = this.#db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .some((row) => text(row.name, 'name') === column);
+    if (!present) this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   /** Insert a pin or accept the same key. Throws, without writing, when the key differs. */

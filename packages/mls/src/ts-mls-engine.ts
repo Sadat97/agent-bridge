@@ -77,7 +77,8 @@ const STATE_VERSION = 1;
 /**
  * Unpublished drafts a receiver will skip. Each aborted application message
  * or commit burns one generation the peer never sees. 32 covers a long run of
- * discarded drafts; a larger gap is not applied and does not halt the topic.
+ * discarded drafts. The sender refuses an abort that would burn one more, and
+ * a ciphertext past this cap halts the peer: the relay will not skip that seq.
  * Skipped keys are not kept (`retainKeysForGenerations: 0`), so an unpublished
  * ciphertext cannot be decrypted once the peer has moved past it.
  */
