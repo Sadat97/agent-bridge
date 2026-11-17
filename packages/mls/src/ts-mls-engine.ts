@@ -133,6 +133,8 @@ class TsMlsEngine implements MlsEngine {
       keyRetentionConfig: {
         ...defaultKeyRetentionConfig,
         retainKeysForGenerations: 0,
+        // 0 does not drop history: Array.prototype.slice(-0) keeps every epoch.
+        retainKeysForEpochs: 1,
         maximumForwardRatchetSteps: 0,
       },
       authService: {
@@ -273,7 +275,7 @@ class TsMlsEngine implements MlsEngine {
     const removed = inspection.proposals.flatMap((proposal) => (proposal.kind === 'remove' && proposal.removed ? [proposal.removed] : []));
     // The update path is not a proposal. A member can otherwise replace the
     // credential on their own leaf, and an update-only commit would be accepted.
-    if (credentialRebound(beforeMembers, this.members(next), added)) {
+    if (!commitKeepsIdentity(beforeMembers, this.members(next), inspection)) {
       return { kind: 'rejected', reason: 'credential changed' };
     }
     const leafByKey = new Map(this.members(next).map((member) => [toBase64(member.signatureKey), member.leafIndex]));
@@ -366,19 +368,37 @@ function forgetOldSecrets(client: ClientState): ClientState {
   };
 }
 
-function credentialRebound(before: Member[], after: Member[], added: Member[]): boolean {
-  const previous = new Map(before.map((member) => [toBase64(member.signatureKey), encodeBridgeCredential(member.credential)]));
-  const addedKeys = new Set(added.map((member) => toBase64(member.signatureKey)));
+function sameIdentity(left: Credential, right: Credential): boolean {
+  return left.handle === right.handle && left.deviceId === right.deviceId && bytesEqual(left.identityKey, right.identityKey);
+}
+
+/**
+ * An update path or Update proposal may rotate HPKE and signature keys.
+ * Handle, identity key, and device id must stay the committer's current leaf.
+ */
+function commitKeepsIdentity(before: Member[], after: Member[], commit: CommitInspection): boolean {
+  const beforeByLeaf = new Map(before.map((member) => [member.leafIndex, member]));
+  for (const proposal of commit.proposals) {
+    if (proposal.kind !== 'update' || proposal.leafIndex === undefined) continue;
+    const prior = beforeByLeaf.get(proposal.leafIndex);
+    if (!prior || !proposal.credential || !sameIdentity(prior.credential, proposal.credential)) return false;
+  }
+  const addedKeys = new Set(
+    commit.proposals.flatMap((proposal) => (proposal.kind === 'add' && proposal.added ? [toBase64(proposal.added.signatureKey)] : [])),
+  );
+  const committerBefore = beforeByLeaf.get(commit.committer.leafIndex);
+  const committerAfter = after.find((member) => member.leafIndex === commit.committer.leafIndex);
+  if (committerBefore && committerAfter && !sameIdentity(committerBefore.credential, committerAfter.credential)) return false;
   for (const member of after) {
-    const key = toBase64(member.signatureKey);
-    const prior = previous.get(key);
-    if (prior === undefined) {
-      if (!addedKeys.has(key)) return true;
+    const prior = beforeByLeaf.get(member.leafIndex);
+    if (!prior) {
+      if (!addedKeys.has(toBase64(member.signatureKey))) return false;
       continue;
     }
-    if (!bytesEqual(prior, encodeBridgeCredential(member.credential))) return true;
+    if (addedKeys.has(toBase64(member.signatureKey))) continue;
+    if (!sameIdentity(prior.credential, member.credential)) return false;
   }
-  return false;
+  return true;
 }
 
 function keyPackageFromMessage(message: Uint8Array): KeyPackage {
@@ -437,7 +457,11 @@ function summarizeProposal(client: ClientState, proposal: Proposal, senderLeafIn
     case 'remove':
       return { kind: 'remove', removed: memberAt(client, proposal.remove.removed) };
     case 'update':
-      return { kind: 'update', leafIndex: senderLeafIndex };
+      return {
+        kind: 'update',
+        leafIndex: senderLeafIndex,
+        credential: memberFromLeaf(proposal.update.leafNode, senderLeafIndex ?? -1)?.credential,
+      };
     case 'psk':
       return { kind: 'psk' };
     case 'reinit':

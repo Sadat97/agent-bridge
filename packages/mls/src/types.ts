@@ -23,7 +23,7 @@ export interface Member {
 export type ProposalSummary =
   | { kind: 'add'; added?: Member }
   | { kind: 'remove'; removed?: Member }
-  | { kind: 'update'; leafIndex?: LeafIndex }
+  | { kind: 'update'; leafIndex?: LeafIndex; credential?: Credential }
   | { kind: 'psk' }
   | { kind: 'reinit' }
   | { kind: 'external_init' }

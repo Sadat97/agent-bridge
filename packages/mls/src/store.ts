@@ -262,6 +262,20 @@ export class MlsStore {
     });
   }
 
+  /**
+   * The staged application ciphertext is being discarded, but its ratchet
+   * generation stays consumed. The next encrypt continues from `mlsState`.
+   */
+  keepRatchet(topicId: string, mlsState: Uint8Array, epoch: bigint): void {
+    this.transaction(() => {
+      const result = this.#db
+        .prepare('UPDATE topics SET mls_state = ?, epoch = ? WHERE topic_id = ?')
+        .run(mlsState, epochNumber(epoch), topicId);
+      if (result.changes !== 1) throw new MlsOperationError('not_found', 'no such topic');
+      this.#db.prepare('DELETE FROM pending_outbound WHERE topic_id = ?').run(topicId);
+    });
+  }
+
   clearPending(topicId: string): void {
     this.transaction(() => {
       this.#db.prepare('DELETE FROM pending_outbound WHERE topic_id = ?').run(topicId);

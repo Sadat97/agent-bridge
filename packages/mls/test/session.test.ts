@@ -93,8 +93,8 @@ describe('multi-member sessions', () => {
     await expect(joined.stageMessage({ type: 'update', body: 'too soon' })).rejects.toMatchObject({ code: 'topic_pending_join' });
     const decline = await joined.stageMessage({ type: 'leave' });
     expect(decline.kind).toBe('application');
-    await expect(joined.abortStaged()).rejects.toMatchObject({ code: 'outbound_pending' });
-    expect(joined.staged()?.message).toEqual(decline.message);
+    await joined.abortStaged();
+    expect(joined.staged()).toBeUndefined();
     await joined.acceptJoin();
     expect(joined.status).toBe('active');
 
@@ -116,7 +116,6 @@ describe('multi-member sessions', () => {
     expect(owner.staged()?.message).toEqual(first.message);
     expect(owner.lastSeq).toBe(base + 1);
     await expect(owner.stageMessage({ type: 'update', body: 'two' })).rejects.toMatchObject({ code: 'outbound_pending' });
-    await expect(owner.abortStaged()).rejects.toMatchObject({ code: 'outbound_pending' });
 
     await owner.confirmStaged(base + 2);
     const second = await owner.stageMessage({ type: 'update', body: 'two' });
@@ -126,6 +125,48 @@ describe('multi-member sessions', () => {
     if (firstRead.kind !== 'application') throw new Error('expected application');
     const secondRead = await bob.engine.process(firstRead.next, second.message, () => true);
     expect(secondRead.kind).toBe('application');
+  });
+
+  it('does not reuse an application generation after abort, and a skipped generation halts', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const base = bob.engine.deserialize(bob.engine.serialize(bobSession.confirmedState()));
+    const epoch = bobSession.epoch;
+    const before = bob.engine.serialize(bobSession.confirmedState());
+    const first = await owner.stageMessage({ type: 'update', body: 'one' });
+    await owner.abortStaged();
+    expect(owner.staged()).toBeUndefined();
+    const second = await owner.stageMessage({ type: 'update', body: 'two' });
+
+    const fromBase = bob.engine.deserialize(bob.engine.serialize(base));
+    expect((await bob.engine.process(fromBase, first.message, () => true)).kind).toBe('application');
+    await expect(bob.engine.process(bob.engine.deserialize(bob.engine.serialize(base)), second.message, () => true)).rejects.toThrow();
+
+    const halted = await bobSession.receive(bobSession.lastSeq + 1, second.message);
+    expect(halted).toMatchObject({ kind: 'halted' });
+    if (halted.kind === 'halted') expect(halted.reason.length).toBeGreaterThan(0);
+    expect(bobSession.status).toBe('halted');
+    expect(bobSession.epoch).toBe(epoch);
+    expect(bob.engine.serialize(bobSession.confirmedState())).toEqual(before);
+    await expect(bobSession.stageMessage({ type: 'update', body: 'wedged' })).rejects.toMatchObject({ code: 'topic_halted' });
+  });
+
+  it('halts when the next commit cannot be framed', async () => {
+    const bob = makePerson('bob');
+    const { owner, session } = await connected([bob]);
+    const bobSession = session.get(bob)!;
+    const epoch = bobSession.epoch;
+    const before = bob.engine.serialize(bobSession.confirmedState());
+    const commit = await owner.stageCommit();
+    const truncated = commit.message.subarray(0, 3);
+    const halted = await bobSession.receive(bobSession.lastSeq + 1, truncated);
+    expect(halted).toMatchObject({ kind: 'halted' });
+    if (halted.kind === 'halted') expect(halted.reason.length).toBeGreaterThan(0);
+    expect(bobSession.status).toBe('halted');
+    expect(bobSession.epoch).toBe(epoch);
+    expect(bob.engine.serialize(bobSession.confirmedState())).toEqual(before);
+    await expect(bobSession.stageMessage({ type: 'update', body: 'after' })).rejects.toMatchObject({ code: 'topic_halted' });
   });
 
   it('halts on an application message that cannot be decrypted, and refuses a Welcome for another group', async () => {

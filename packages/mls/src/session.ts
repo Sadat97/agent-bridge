@@ -421,12 +421,17 @@ export class TopicSession {
   async abortStaged(): Promise<void> {
     await this.#exclusive(async () => {
       if (!this.#pending) return;
-      // An application ciphertext already consumed a generation. Dropping it and
-      // encrypting again would authenticate a second plaintext with that generation.
-      // A commit draws fresh path secrets, so a rejected commit can be discarded.
       if (this.#pending.kind === 'application') {
-        throw new MlsOperationError('outbound_pending', 'an application message has already consumed its ratchet generation');
+        // The ciphertext may be dropped. The generation it consumed is not:
+        // the next encrypt starts from this state, so it is a new generation.
+        const next = this.engine.deserialize(this.#pending.mlsState);
+        this.store.keepRatchet(this.topicId, this.#pending.mlsState, this.engine.epoch(next));
+        this.#confirmed = next;
+        this.epoch = this.engine.epoch(next);
+        this.#pending = undefined;
+        return;
       }
+      // A commit draws fresh path secrets, so a rejected one can be rebuilt.
       this.store.clearPending(this.topicId);
       this.#pending = undefined;
     });
