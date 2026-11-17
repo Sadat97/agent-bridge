@@ -93,6 +93,8 @@ export interface KeyPackageSummary {
   cipherSuite: number;
   /** The leaf's signature public key. Must equal the uploading device's key. */
   signatureKey: Uint8Array;
+  /** BasicCredential.identity. For Agent Bridge this is a BridgeCredential (section 8.2). */
+  credentialIdentity: Uint8Array;
   /** The encoded KeyPackage, without the MLSMessage prefix. */
   keyPackage: Uint8Array;
 }
@@ -108,7 +110,13 @@ export function decodeKeyPackageMessage(message: Uint8Array): KeyPackageSummary 
   r.opaque(); // init_key
   r.opaque(); // leaf_node.encryption_key
   const signatureKey = r.opaque();
-  return { cipherSuite, signatureKey, keyPackage };
+  // Credential sits directly after the signature key (RFC 9420 LeafNode).
+  // basic = 1; its identity is opaque<V>. x509 and unknown types are rejected:
+  // v1 leaves carry a BridgeCredential and nothing else.
+  const credentialType = r.u16();
+  if (credentialType !== 1) throw new DecodeError(`unsupported credential type ${credentialType}`);
+  const credentialIdentity = r.opaque();
+  return { cipherSuite, signatureKey, credentialIdentity, keyPackage };
 }
 
 /**

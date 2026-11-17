@@ -15,11 +15,15 @@ import { encodeKeyPackage, makeKeyPackageRef } from 'ts-mls/keyPackage.js';
 import {
   addApprovalContent,
   bytesToUuid,
+  decodeBridgeCredential,
+  decodeCommitApprovals,
   DecodeError,
   decodeKeyPackageMessage,
   decodeMlsMessageHeader,
   decodeWelcomeMessage,
   ed25519PublicKeyFromSeed,
+  encodeBridgeCredential,
+  encodeCommitApprovals,
   fromBase64,
   generateEd25519KeyPair,
   issueDeviceCert,
@@ -31,6 +35,7 @@ import {
   TlsWriter,
   utf8,
   uuidToBytes,
+  validateLeafCredential,
   verifyDeviceCert,
   verifyWithLabel,
 } from '../src/index.ts';
@@ -185,7 +190,70 @@ describe('MLS framing against ts-mls', async () => {
     const summary = decodeKeyPackageMessage(message);
     expect(summary.cipherSuite).toBe(1);
     expect(summary.signatureKey).toEqual(bob.publicPackage.leafNode.signaturePublicKey);
+    expect(summary.credentialIdentity).toEqual(utf8('bob'));
     expect(summary.keyPackage).toEqual(encodeKeyPackage(bob.publicPackage));
     expect(keyPackageRef(summary.keyPackage)).toEqual(await makeKeyPackageRef(bob.publicPackage, impl.hash));
+  });
+});
+
+describe('bridge credentials', () => {
+  const deviceId = '0d9f6c5e-6f0b-4a0e-9a57-2a1d8f0b9c11';
+
+  function credential() {
+    const identity = generateEd25519KeyPair();
+    const device = generateEd25519KeyPair();
+    const deviceCert = issueDeviceCert(identity.privateKey, {
+      handle: 'mohamed',
+      deviceId,
+      signatureKey: device.publicKey,
+      createdAt: 1_763_300_000,
+    });
+    return {
+      identity,
+      device,
+      encoded: encodeBridgeCredential({
+        handle: 'mohamed',
+        identityKey: identity.publicKey,
+        deviceId,
+        deviceCert,
+      }),
+    };
+  }
+
+  it('round-trips and validates only under the certified key and pin', () => {
+    const cred = credential();
+    const decoded = decodeBridgeCredential(cred.encoded);
+    expect(decoded.handle).toBe('mohamed');
+    expect(decoded.deviceId).toBe(deviceId);
+    expect(validateLeafCredential(cred.encoded, cred.device.publicKey).ok).toBe(true);
+    expect(validateLeafCredential(cred.encoded, cred.device.publicKey, cred.identity.publicKey).ok).toBe(true);
+    expect(validateLeafCredential(cred.encoded, generateEd25519KeyPair().publicKey).ok).toBe(false);
+    expect(validateLeafCredential(cred.encoded, cred.device.publicKey, generateEd25519KeyPair().publicKey).ok).toBe(false);
+    expect(validateLeafCredential(utf8('alice'), cred.device.publicKey).ok).toBe(false);
+    expect(() => encodeBridgeCredential({ ...decodeBridgeCredential(cred.encoded), handle: 'No' })).toThrow(TypeError);
+  });
+});
+
+describe('CommitApprovals', () => {
+  it('round-trips add, remove, and leave entries and rejects trailing bytes', () => {
+    const deviceKey = generateEd25519KeyPair().publicKey;
+    const encoded = encodeCommitApprovals({
+      adds: [{ approvalId: 'apr_add', deviceKey, expiresAt: 1_763_900_000, signature: Uint8Array.of(1, 2, 3) }],
+      removes: [
+        { kind: 'remove', approvalId: 'apr_rm', deviceKey, signature: Uint8Array.of(4) },
+        { kind: 'leave', approvalId: 'apr_lv', deviceKey, leaveSeq: 42 },
+      ],
+    });
+    expect(decodeCommitApprovals(encoded)).toEqual({
+      adds: [{ approvalId: 'apr_add', deviceKey, expiresAt: 1_763_900_000, signature: Uint8Array.of(1, 2, 3) }],
+      removes: [
+        { kind: 'remove', approvalId: 'apr_rm', deviceKey, signature: Uint8Array.of(4) },
+        { kind: 'leave', approvalId: 'apr_lv', deviceKey, leaveSeq: 42 },
+      ],
+    });
+    expect(decodeCommitApprovals(encodeCommitApprovals({ adds: [], removes: [] }))).toEqual({ adds: [], removes: [] });
+    expect(() => decodeCommitApprovals(Uint8Array.of(...encoded, 0))).toThrow(DecodeError);
+    expect(() => decodeCommitApprovals(Uint8Array.of(2, 0, 0))).toThrow(DecodeError);
+    expect(() => decodeCommitApprovals(encoded.subarray(0, encoded.length - 1))).toThrow(DecodeError);
   });
 });

@@ -1406,7 +1406,16 @@ Access control is mandatory: only current, non-stale members can post or fetch a
 
 - Each bridge has an Ed25519 device key: its MLS leaf signature key, also used for relay-auth challenges (distinct label).
 - Device certificate: `Sign(identity_key, label "device-cert", {handle, device_id, device_signature_pubkey, created_at})`.
-- MLS `BasicCredential.identity` = encoded `{handle, identity_pubkey, device_id, device_cert}`.
+- MLS `BasicCredential.identity` is a `BridgeCredential`, TLS-encoded like the signatures in section 8.5:
+
+  ```
+  struct {
+    opaque handle<V>;
+    opaque identity_pubkey<V>;   // 32-byte Ed25519 public key
+    opaque device_id<V>;         // 16 raw bytes
+    opaque device_cert<V>;       // the device certificate above
+  } BridgeCredential;
+  ```
 - **Every bridge validates every leaf** (KeyPackages before adding, new leaves in commits, the whole tree on Welcome): the certificate verifies under `identity_pubkey`, the certified key equals the leaf `signature_key`, and `identity_pubkey` matches the pinned contact for that handle. Never use a test or "accept all" credential validator.
 - KeyPackages are one-time-use and expire after 30 days.
 

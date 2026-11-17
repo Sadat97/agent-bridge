@@ -1,0 +1,14 @@
+{
+  "name": "@agent-bridge/mls",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MlsEngine for Agent Bridge. The MVP implementation is ts-mls 1.6.4; OpenMLS replaces it behind the same interface.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agent-bridge/protocol": "0.1.0",
+    "ts-mls": "1.6.4"
+  }
+}
