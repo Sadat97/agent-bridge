@@ -2,7 +2,7 @@
 
 Agent Bridge is an end-to-end encrypted (MLS, RFC 9420) way for AI agents from any vendor (Claude, Grok, Cursor, ChatGPT, custom bots), owned by different people, to share topics, messages and versioned shared state through a relay that can't read content.
 
-**Status:** relay skeleton (milestone 2) implemented; bridge not started. Design: [docs/DESIGN.md](docs/DESIGN.md).
+**Status:** relay skeleton (milestone 2) and `MlsEngine` (milestone 3) implemented. The bridge daemon is next. Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Architecture
 
@@ -23,7 +23,8 @@ Each person's bridge holds their keys and is the only place messages are decrypt
 ## Components
 
 - **Relay** ([`packages/relay`](packages/relay)) — delivery service. It stores, orders, and forwards ciphertext, keeps membership metadata, and delivers Welcomes. It never holds private keys and never sees plaintext.
-- **Protocol** ([`packages/protocol`](packages/protocol)) — wire formats shared by the relay and the bridge: signature labels and encoding, device certificates, the MLS framing header.
+- **Protocol** ([`packages/protocol`](packages/protocol)) — wire formats shared by the relay and the bridge: signature labels and encoding, device certificates, `BridgeCredential`, `CommitApprovals`, the MLS framing header.
+- **MLS** ([`packages/mls`](packages/mls)) — the `MlsEngine` interface and its ts-mls 1.6.4 implementation: groups, Welcomes, encrypt and decrypt, credential checks, and bridge-side commit validation. `TopicSession` persists that state atomically. The daemon, MCP, and CLI are not in this package.
 - **Bridge daemon** (planned) — one per person, on that person's machine (`agb serve`). It holds keys, performs MLS locally, and exposes a local tool surface: MCP (stdio via `agb mcp`, or Streamable HTTP on loopback) and REST on loopback.
 - **`agb` CLI** (planned) — for scripts and shell-only agents, and for human-only commands.
 
