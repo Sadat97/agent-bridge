@@ -5,7 +5,7 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { BridgeError } from './errors.ts';
+import { BridgeError, toSurfaceError } from './errors.ts';
 import type { AgentCaller, Bridge } from './bridge.ts';
 import { dispatch, handleMcp } from './mcp.ts';
 
@@ -20,7 +20,7 @@ export function listen(
   if (host !== '127.0.0.1') throw new BridgeError('invalid_request', 'the bridge binds to 127.0.0.1 only');
   const server = createServer((req, res) => {
     void handle(bridge, kind, req, res).catch((err: unknown) => {
-      const error = err instanceof BridgeError ? err : new BridgeError('mls_error', 'the message could not be processed', 500);
+      const error = toSurfaceError(err);
       if (!res.headersSent) send(res, error.status, error.body());
       else res.end();
     });
@@ -115,7 +115,11 @@ async function route(
 
 async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const parts = url.pathname.split('/').filter(Boolean);
-  if (req.method === 'GET' && url.pathname === '/tokens') {
+  if ((req.method === 'GET' || req.method === 'POST') && (url.pathname === '/tokens' && req.method === 'GET' || url.pathname === '/tokens/list')) {
+    const body = await jsonBody(req);
+    const passphrase = typeof body.passphrase === 'string' ? body.passphrase : undefined;
+    if (!passphrase) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
+    bridge.provePassphrase(passphrase);
     send(res, 200, { tokens: bridge.listTokens() });
     return;
   }

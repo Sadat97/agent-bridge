@@ -56,7 +56,10 @@ async function run(): Promise<unknown> {
     const topics = flags.all === 'true' ? '*' : (flags.topics ?? '').split(',').filter(Boolean);
     return humanPost('/tokens', { passphrase, label, topics: topics === '*' || flags.all === 'true' ? '*' : topics });
   }
-  if (command === 'token' && sub === 'list') return humanGet('/tokens');
+  if (command === 'token' && sub === 'list') {
+    const passphrase = await promptPassphrase('Identity passphrase: ');
+    return humanPost('/tokens/list', { passphrase });
+  }
   if (command === 'token' && sub === 'revoke') {
     const passphrase = await promptPassphrase('Identity passphrase: ');
     return humanPost(`/tokens/${rest[0]}/revoke`, { passphrase });
@@ -132,13 +135,6 @@ async function humanPost(path: string, body: unknown): Promise<unknown> {
   const parsed = (await res.json()) as { error?: string; message?: string };
   if (!res.ok) throw new BridgeError(String(parsed.error ?? 'mls_error'), String(parsed.message ?? 'request failed'), res.status);
   return parsed;
-}
-
-async function humanGet(path: string): Promise<unknown> {
-  const res = await fetch(`http://127.0.0.1:${approvalPort}${path}`, {
-    headers: { host: `127.0.0.1:${approvalPort}` },
-  });
-  return res.json();
 }
 
 async function proxyMcp(tokenFile: string): Promise<void> {

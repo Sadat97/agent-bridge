@@ -343,6 +343,10 @@ export class LocalStore {
     });
   }
 
+  updateRequest(id: string, request: unknown): void {
+    this.db.prepare('UPDATE approvals SET request_json = ? WHERE approval_id = ?').run(JSON.stringify(request), id);
+  }
+
   decideApproval(id: string, status: 'approved' | 'rejected' | 'done' | 'expired'): void {
     this.db
       .prepare(`UPDATE approvals SET status = ?, decided_at = ? WHERE approval_id = ?`)

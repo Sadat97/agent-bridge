@@ -26,7 +26,7 @@ import {
 } from '@agent-bridge/mls';
 import type { AddRequest, Credential, MlsEngine, RemoveRequest, TopicSession as Session } from '@agent-bridge/mls';
 import { MlsStore } from '@agent-bridge/mls';
-import { BridgeError } from './errors.ts';
+import { BridgeError, toSurfaceError } from './errors.ts';
 import { fingerprint } from './fingerprint.ts';
 import { applyPatch, hashBytes, hashLabel, pointerValue } from './json.ts';
 import type { PatchOp } from './json.ts';
@@ -41,6 +41,8 @@ import type WebSocket from 'ws';
 const KEY_LOW = 10;
 const KEY_TARGET = 20;
 const SNAPSHOT_EVERY = 50;
+/** Section 5.6: a signed add is retried until this claim lifetime, not the 72-hour decision window. */
+const INVITE_CLAIM_SECONDS = 7 * 24 * 60 * 60;
 
 export interface AgentCaller {
   label: string;
@@ -270,12 +272,52 @@ export class Bridge {
   }
 
   async syncAll(): Promise<{ topics_synced: number; new_messages: number }> {
+    await this.#topUp();
+    await this.#retryInvites();
     const welcomes = await this.#takeWelcomes();
     let messages = welcomes;
     for (const topicId of [...this.#sessions.keys()]) {
       messages += await this.#withTopic(topicId, () => this.#syncTopic(topicId));
     }
     return { topics_synced: this.#sessions.size, new_messages: messages };
+  }
+
+  /** Agent sync. A topic id outside the token is an error and does not report other topics. */
+  async sync(agent: AgentCaller, topicId?: string): Promise<{ topics_synced: number; new_messages: number }> {
+    if (topicId !== undefined) {
+      this.#requireScope(agent, topicId);
+      await this.#topUp();
+      await this.#retryInvites();
+      const messages = await this.#withTopic(topicId, () => this.#syncTopic(topicId));
+      return { topics_synced: 1, new_messages: messages };
+    }
+    if (agent.topics === '*') return this.syncAll();
+    await this.#topUp();
+    await this.#retryInvites();
+    let messages = 0;
+    let topics = 0;
+    for (const id of agent.topics) {
+      if (!this.#sessions.has(id)) continue;
+      messages += await this.#withTopic(id, () => this.#syncTopic(id));
+      topics += 1;
+    }
+    return { topics_synced: topics, new_messages: messages };
+  }
+
+  /**
+   * Stage an application draft and discard it. The 33rd discard in one epoch
+   * throws `self_update_required` and leaves the draft staged. Not an agent tool.
+   */
+  async discardDraft(topicId: string): Promise<void> {
+    const session = this.#requireActive(topicId);
+    try {
+      await this.#withTopic(topicId, async () => {
+        if (!session.staged()) await session.stageMessage({ type: 'update', body: 'discarded draft' });
+        await session.abortStaged();
+      });
+    } catch (err) {
+      throw toSurfaceError(err);
+    }
   }
 
   async listTopics(agent: AgentCaller, includeClosed: boolean): Promise<{ topics: Array<Record<string, unknown>> }> {
@@ -413,17 +455,22 @@ export class Bridge {
     if (limit < 1 || limit > 100) throw new BridgeError('invalid_request', 'limit must be 1..100');
     const after = input.sinceSeq ?? this.local.cursor(agent.label, input.topicId);
     const rows = this.local.envelopes(input.topicId, after, limit);
-    const wanted = new Set(input.types ?? ['update', 'question', 'request', 'answer', 'system']);
     const messages = [];
-    let next = after;
+    let cursor = after;
     for (const row of rows) {
-      next = row.seq;
-      const shown = presentMessage(row);
-      if (!shown || !wanted.has(String(shown.type))) continue;
+      const shown = visibleMessage(row);
+      if (!shown) {
+        // A stale patch is not shown and does not block later messages.
+        cursor = row.seq;
+        continue;
+      }
+      if (input.types !== undefined && !input.types.includes(String(shown.type))) break;
       messages.push(shown);
+      cursor = row.seq;
+      if (messages.length === limit) break;
     }
-    if (input.sinceSeq === undefined && rows.length > 0) this.local.advanceCursor(agent.label, input.topicId, next);
-    return { messages, next_seq: next };
+    if (input.sinceSeq === undefined && cursor !== after) this.local.advanceCursor(agent.label, input.topicId, cursor);
+    return { messages, next_seq: cursor };
   }
 
   async postMessage(
@@ -536,6 +583,7 @@ export class Bridge {
       }
       if (row.kind === 'invite') {
         const seq = await this.#commitInvite(row, key);
+        if (seq < 0) return { status: 'pending' };
         this.local.decideApproval(approvalId, 'done');
         return { status: 'approved', seq };
       }
@@ -691,7 +739,7 @@ export class Bridge {
     if (!certified || certified.deviceId !== device.deviceId || !bytesEqual(certified.signatureKey, device.signatureKey)) {
       throw new BridgeError('mls_error', 'device certificate does not match the account', 500);
     }
-    const expiresAt = Math.floor(Date.now() / 1000) + loadPolicy(this.paths.policy).approval_expiry_hours * 3600;
+    const expiresAt = Math.floor(Date.now() / 1000) + INVITE_CLAIM_SECONDS;
     const signature = signWithLabel(
       key,
       SignatureLabel.add,
@@ -714,8 +762,15 @@ export class Bridge {
       });
     } catch (err) {
       if (err instanceof BridgeError && err.details.relay_error === 'no_key_package') {
-        this.local.decideApproval(row.approvalId, 'approved');
-        throw new BridgeError('relay_unavailable', 'the invitee has no KeyPackage yet; the approval stays approved', 503);
+        // Stay pending. sync retries the stored signature until expiresAt. No second approve.
+        this.local.updateRequest(row.approvalId, {
+          ...(row.request as Record<string, unknown>),
+          awaitingKeyPackage: true,
+          signature: Buffer.from(signature).toString('base64'),
+          expiresAt,
+          deviceId: device.deviceId,
+        });
+        return -1;
       }
       throw err;
     }
@@ -751,50 +806,95 @@ export class Bridge {
   }
 
   async #sendApplication(session: Session, input: Parameters<Session['stageMessage']>[0]): Promise<number> {
-    return this.#withTopic(session.topicId, async () => {
-      if (session.unpublishedApplication >= UNPUBLISHED_GENERATION_SKIP) await this.#sendCommit(session, {});
-      for (let attempt = 0; attempt < 5; attempt++) {
-        await this.#syncTopic(session.topicId);
-        if (session.staged()) await session.abortStaged();
-        const staged = await session.stageMessage(input);
-        const posted = await this.relay.post(session.topicId, staged);
-        if (posted.ok) {
-          await this.#finishPost(session, posted.seq);
-          return posted.seq;
-        }
-        if (posted.code === 'stale_epoch') {
+    try {
+      return await this.#withTopic(session.topicId, async () => {
+        if (session.unpublishedApplication >= UNPUBLISHED_GENERATION_SKIP) await this.#sendCommit(session, {});
+        for (let attempt = 0; attempt < 5; attempt++) {
           await this.#syncTopic(session.topicId);
-          if (session.staged()) await session.abortStaged();
-          continue;
+          if (session.staged()) await this.#releaseStaged(session);
+          const staged = await session.stageMessage(input);
+          const posted = await this.relay.post(session.topicId, staged);
+          if (posted.ok) {
+            await this.#finishPost(session, posted.seq);
+            return posted.seq;
+          }
+          if (posted.code === 'stale_epoch') {
+            await this.#syncTopic(session.topicId);
+            if (session.staged()) await this.#releaseStaged(session);
+            continue;
+          }
+          if (session.staged()) await this.#releaseStaged(session);
+          throw new BridgeError('relay_unavailable', posted.message, 503, { relay_error: posted.code });
         }
-        if (session.staged()) await session.abortStaged();
-        throw new BridgeError('relay_unavailable', posted.message, 503, { relay_error: posted.code });
-      }
-      throw new BridgeError('relay_unavailable', 'the relay kept rejecting the epoch', 503);
-    });
+        throw new BridgeError('relay_unavailable', 'the relay kept rejecting the epoch', 503);
+      });
+    } catch (err) {
+      throw toSurfaceError(err);
+    }
   }
 
   async #sendCommit(session: Session, input: { adds?: AddRequest[]; removes?: RemoveRequest[] }): Promise<number> {
-    return this.#withTopic(session.topicId, async () => {
-      for (let attempt = 0; attempt < 5; attempt++) {
-        await this.#syncTopic(session.topicId);
-        if (session.staged()) await session.abortStaged();
-        const staged = await session.stageCommit(input);
-        const posted = await this.relay.post(session.topicId, staged);
-        if (posted.ok) {
-          await this.#finishPost(session, posted.seq);
-          return posted.seq;
-        }
-        if (posted.code === 'stale_epoch') {
+    try {
+      return await this.#withTopic(session.topicId, async () => {
+        for (let attempt = 0; attempt < 5; attempt++) {
           await this.#syncTopic(session.topicId);
-          if (session.staged()) await session.abortStaged();
-          continue;
+          if (session.staged()) {
+            const postedExisting = await this.#releaseStaged(session);
+            if (postedExisting) continue;
+          }
+          const staged = await session.stageCommit(input);
+          const posted = await this.relay.post(session.topicId, staged);
+          if (posted.ok) {
+            await this.#finishPost(session, posted.seq);
+            return posted.seq;
+          }
+          if (posted.code === 'stale_epoch') {
+            await this.#syncTopic(session.topicId);
+            if (session.staged()) await this.#releaseStaged(session);
+            continue;
+          }
+          if (session.staged()) await this.#releaseStaged(session);
+          throw new BridgeError('relay_unavailable', posted.message, 503, { relay_error: posted.code });
         }
-        if (session.staged()) await session.abortStaged();
-        throw new BridgeError('relay_unavailable', posted.message, 503, { relay_error: posted.code });
+        throw new BridgeError('relay_unavailable', 'the relay kept rejecting the epoch', 503);
+      });
+    } catch (err) {
+      throw toSurfaceError(err);
+    }
+  }
+
+  /**
+   * Get a staged draft out of the way. An application draft at the cap is
+   * dropped without burning another generation. A commit at the cap is posted,
+   * because peers can still decrypt it and aborting is what the cap forbids.
+   * Returns true when a commit ciphertext was posted.
+   */
+  async #releaseStaged(session: Session): Promise<boolean> {
+    const staged = session.staged();
+    if (!staged) return false;
+    const atCap =
+      staged.kind === 'application'
+        ? session.unpublishedApplication >= UNPUBLISHED_GENERATION_SKIP
+        : session.unpublishedHandshake >= UNPUBLISHED_GENERATION_SKIP;
+    if (!atCap) {
+      await session.abortStaged();
+      return false;
+    }
+    if (staged.kind === 'application') {
+      await session.dropStaged();
+      return false;
+    }
+    const posted = await this.relay.post(session.topicId, staged);
+    if (!posted.ok) {
+      if (posted.code === 'stale_epoch') {
+        await this.#syncTopic(session.topicId);
+        if (session.staged()) await session.dropStaged();
+        return false;
       }
-      throw new BridgeError('relay_unavailable', 'the relay kept rejecting the epoch', 503);
-    });
+      throw new BridgeError('relay_unavailable', posted.message, 503, { relay_error: posted.code });
+    }
+    await this.#finishPost(session, posted.seq);
+    return true;
   }
 
   /** Process anything sequenced ahead of our post, then confirm it if the echo has not already. */
@@ -925,6 +1025,42 @@ export class Bridge {
       taken += 1;
     }
     return taken;
+  }
+
+  async #retryInvites(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    for (const row of this.local.approvals('*', 'pending')) {
+      const request = row.request as {
+        awaitingKeyPackage?: boolean;
+        expiresAt?: number;
+        signature?: string;
+        deviceId?: string;
+      };
+      if (!request.awaitingKeyPackage || !request.signature || !request.deviceId || request.expiresAt === undefined) continue;
+      if (request.expiresAt <= now) {
+        this.local.decideApproval(row.approvalId, 'expired');
+        continue;
+      }
+      const signature = new Uint8Array(Buffer.from(request.signature, 'base64'));
+      try {
+        const keyPackage = await this.relay.claim(request.deviceId, {
+          topicId: row.topicId,
+          approvalId: row.approvalId,
+          expiresAt: request.expiresAt,
+          approval: signature,
+        });
+        const session = this.#sessions.get(row.topicId);
+        if (!session || session.status !== 'active') continue;
+        await this.#sendCommit(session, {
+          adds: [{ keyPackage, approvalId: row.approvalId, expiresAt: request.expiresAt, signature }],
+        });
+        await this.#sendSnapshot(session, 'join');
+        this.local.decideApproval(row.approvalId, 'done');
+      } catch (err) {
+        const surface = toSurfaceError(err);
+        if (surface.details.relay_error === 'no_key_package' || surface.code === 'relay_unavailable') continue;
+      }
+    }
   }
 
   async #topUp(): Promise<void> {
@@ -1088,13 +1224,21 @@ function inScope(agent: AgentCaller, topicId: string): boolean {
   return agent.topics === '*' || agent.topics.includes(topicId);
 }
 
-function presentMessage(row: EnvelopeRow): Record<string, unknown> | undefined {
+function visibleMessage(row: EnvelopeRow): Record<string, unknown> | undefined {
   if (row.type === 'state_patch') {
     if (!row.applied) return undefined;
     const payload = row.payload as { summary?: string; base_version?: number };
     const version = typeof payload.base_version === 'number' ? payload.base_version + 1 : undefined;
     return messageView(row, 'system', typeof payload.summary === 'string' ? payload.summary : 'state updated', { version });
   }
+  if (row.type === 'leave') return messageView(row, 'system', row.body ?? 'left the topic', row.payload);
+  if (row.type === 'invite_proposal' || row.type === 'removal_proposal') {
+    const payload = isRecord(row.payload) ? row.payload : {};
+    const handle = typeof payload.handle === 'string' ? payload.handle : 'someone';
+    const verb = row.type === 'invite_proposal' ? 'Invite' : 'Remove';
+    return messageView(row, 'system', row.body ?? `${verb} ${handle}`, payload);
+  }
+  if (row.type === 'state_snapshot') return messageView(row, 'system', 'state snapshot', row.payload);
   if (!['update', 'question', 'request', 'answer', 'system'].includes(row.type)) return undefined;
   return messageView(row, row.type, row.body ?? undefined, isRecord(row.payload) ? row.payload : {});
 }

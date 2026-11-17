@@ -497,6 +497,21 @@ export class TopicSession {
     });
   }
 
+  /**
+   * Forget a staged ciphertext without advancing the ratchet. The confirmed
+   * state still has that generation, so the caller must commit a new epoch
+   * before encrypting again. Used when an abort would pass the unpublished
+   * cap: the commit makes the ciphertext stale instead of burning one more
+   * generation peers cannot skip.
+   */
+  async dropStaged(): Promise<void> {
+    await this.#exclusive(async () => {
+      if (!this.#pending) return;
+      this.store.clearPending(this.topicId);
+      this.#pending = undefined;
+    });
+  }
+
   async receive(seq: number, message: Uint8Array): Promise<ReceiveResult> {
     return this.#exclusive(async () => {
       if (this.status === 'halted') return { kind: 'halted', reason: this.haltReason ?? 'topic is halted' };

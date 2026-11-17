@@ -48,16 +48,40 @@ export function pathIsSensitive(policy: Policy, path: string): boolean {
 }
 
 function pointerAffects(pattern: string, path: string): boolean {
+  const wanted = segments(pattern);
+  const given = segments(path);
   if (pointerMatch(pattern, path)) return true;
   // Replacing an ancestor rewrites the sensitive child. `/` rewrites everything.
-  const wanted = segments(pattern).filter((segment) => segment !== '**');
-  const given = segments(path);
-  if (given.length >= wanted.length) return false;
+  if (coversAncestor(wanted, given)) return true;
+  // A child of a sensitive path is the same value. `/bookings/*/confirmation/status`
+  // is under `/bookings/*/confirmation`.
+  return coversDescendant(wanted, given);
+}
+
+function coversAncestor(wanted: string[], given: string[]): boolean {
+  const concrete = wanted.filter((segment) => segment !== '**');
+  if (given.length >= concrete.length) return false;
   for (let i = 0; i < given.length; i++) {
-    const segment = wanted[i];
+    const segment = concrete[i];
     if (segment !== undefined && segment !== '*' && segment !== given[i]) return false;
   }
   return true;
+}
+
+/** The pattern matches a proper prefix of `path`. `*` is one segment. */
+function coversDescendant(wanted: string[], given: string[]): boolean {
+  let wi = 0;
+  let gi = 0;
+  while (wi < wanted.length) {
+    const segment = wanted[wi]!;
+    // A trailing ** already matches every longer path in pointerMatch.
+    if (segment === '**') return false;
+    if (gi >= given.length) return false;
+    if (segment !== '*' && segment !== given[gi]) return false;
+    wi += 1;
+    gi += 1;
+  }
+  return gi < given.length;
 }
 
 function pointerMatch(pattern: string, path: string): boolean {

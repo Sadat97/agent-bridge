@@ -4,7 +4,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AgentCaller, Bridge } from './bridge.ts';
-import { BridgeError } from './errors.ts';
+import { BridgeError, toSurfaceError } from './errors.ts';
 import { isPatch } from './json.ts';
 import type { PatchOp } from './json.ts';
 
@@ -53,18 +53,15 @@ export async function handleMcp(bridge: Bridge, agent: AgentCaller, req: Incomin
     const result = await callTool(bridge, agent, message);
     writeRpc(res, message.id, undefined, result);
   } catch (err) {
-    if (err instanceof BridgeError && message.method === 'tools/call') {
+    const surface = toSurfaceError(err);
+    if (message.method === 'tools/call') {
       writeRpc(res, message.id, undefined, {
-        content: [{ type: 'text', text: JSON.stringify(err.body()) }],
+        content: [{ type: 'text', text: JSON.stringify(surface.body()) }],
         isError: true,
       });
       return;
     }
-    if (err instanceof BridgeError) {
-      writeRpc(res, message.id, { code: -32602, message: err.message });
-      return;
-    }
-    writeRpc(res, message.id, { code: -32603, message: 'the message could not be processed' });
+    writeRpc(res, message.id, { code: -32602, message: surface.message });
   }
 }
 
@@ -142,20 +139,11 @@ export async function dispatch(bridge: Bridge, agent: AgentCaller, name: string,
         ...(typeof args.topic_id === 'string' ? { topicId: args.topic_id } : {}),
         ...(typeof args.status === 'string' ? { status: args.status } : {}),
       });
-    case 'sync': {
-      const result = await bridge.syncAll();
-      return {
-        topics_synced: typeof args.topic_id === 'string' ? (inScope(agent, args.topic_id) ? 1 : 0) : result.topics_synced,
-        new_messages: result.new_messages,
-      };
-    }
+    case 'sync':
+      return bridge.sync(agent, typeof args.topic_id === 'string' ? args.topic_id : undefined);
     default:
       throw new BridgeError('not_found', 'unknown tool', 404);
   }
-}
-
-function inScope(agent: AgentCaller, topicId: string): boolean {
-  return agent.topics === '*' || agent.topics.includes(topicId);
 }
 
 function tool(name: string, description: string, inputSchema: object, annotations: object) {

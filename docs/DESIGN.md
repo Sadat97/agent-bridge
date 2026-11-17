@@ -588,7 +588,7 @@ CREATE TABLE identity (
 CREATE TABLE device (
   device_id         TEXT PRIMARY KEY,
   signature_pubkey  BLOB NOT NULL,
-  signature_privkey BLOB NOT NULL,                -- wrapped by the device key (key file, mode 0600, or OS keychain)
+  signature_privkey BLOB NOT NULL,                -- sealed with the storage key (AES-256-GCM); see At-rest wrapping
   device_cert       BLOB NOT NULL
 );
 
