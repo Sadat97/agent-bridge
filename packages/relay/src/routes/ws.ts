@@ -2,7 +2,9 @@ import type { FastifyInstance } from 'fastify';
 import { normalizeUuid } from '@agent-bridge/protocol';
 import { loadDevice, nowSeconds, requireDevice } from '../auth.ts';
 import type { RelayContext } from '../context.ts';
+import { withTransaction } from '../db.ts';
 import { WS_CLOSE_EXPIRED, WS_CLOSE_REVOKED } from '../deliver.ts';
+import { noteCursor } from './topics.ts';
 
 // GET /v1/ws — server pushes RelayEvents (hub.ts) for every topic the device
 // belongs to. The client may send:
@@ -19,6 +21,10 @@ export function wsRoutes(app: FastifyInstance, ctx: RelayContext): void {
   app.get('/v1/ws', { websocket: true, onRequest: requireDevice(ctx) }, (socket, request) => {
     const deviceId = request.device.id;
     const expiresAtMs = request.tokenExpiresAt * 1000;
+    if (ctx.hub.socketCount(deviceId) >= ctx.config.maxSocketsPerDevice) {
+      socket.close(4029, 'too_many_sockets');
+      return;
+    }
     ctx.hub.add(deviceId, socket, expiresAtMs);
 
     let alive = true;
@@ -88,13 +94,9 @@ export function wsRoutes(app: FastifyInstance, ctx: RelayContext): void {
           }
           // Re-check after the parse so a revocation between frames is not applied.
           if (!(await stillAuthorized())) return;
-          // Bounded by the topic's last seq, and only for a current member.
-          await ctx.pool.query(
-            `UPDATE topic_members m SET last_fetched_seq = GREATEST(m.last_fetched_seq, LEAST($3::bigint, t.last_seq))
-               FROM topics t
-              WHERE t.id = m.topic_id AND m.topic_id = $1 AND m.device_id = $2 AND m.removed_at IS NULL`,
-            [topicId, deviceId, msg.seq],
-          );
+          // Bounded by the topic's last seq. Same topic lock as retention, so the
+          // cursor and stale_at cannot diverge.
+          await withTransaction(ctx.pool, (db) => noteCursor(db, topicId, deviceId, msg.seq as number));
           return;
         }
         socket.send(JSON.stringify({ type: 'error', error: 'unknown_type' }));

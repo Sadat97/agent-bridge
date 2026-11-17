@@ -43,6 +43,10 @@ export class Hub {
     return (this.#sockets.get(deviceId)?.size ?? 0) > 0;
   }
 
+  socketCount(deviceId: string): number {
+    return this.#sockets.get(deviceId)?.size ?? 0;
+  }
+
   remove(deviceId: string, socket: EventSocket): void {
     const set = this.#sockets.get(deviceId);
     if (!set) return;

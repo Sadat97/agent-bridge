@@ -20,6 +20,14 @@ export async function runRetention(ctx: RelayContext): Promise<RetentionResult> 
   const cutoff = new Date(now.getTime() - ctx.config.retentionDays * 86_400_000);
 
   const { prunedTopics, staleMembers } = await withTransaction(ctx.pool, async (db) => {
+    // Same topic lock as cursor updates, so a fetch that has already caught up
+    // cannot be marked stale, and a cursor that lands first is visible here.
+    await db.query(
+      `SELECT id FROM topics WHERE id IN (
+         SELECT DISTINCT topic_id FROM mls_messages WHERE created_at < $1
+       ) FOR UPDATE`,
+      [cutoff],
+    );
     // Prune by seq, not just timestamp, so each topic keeps a contiguous suffix.
     const pruned = await db.query(
       `WITH cutoff AS (

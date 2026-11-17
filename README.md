@@ -29,7 +29,7 @@ Each person's bridge holds their keys and is the only place messages are decrypt
 
 ## Development
 
-Requires Node 24+ and Docker. Node runs the TypeScript sources directly; there is no build step.
+Requires Node 26+ and Docker. Node runs the TypeScript sources directly; there is no build step.
 
 ```sh
 npm install

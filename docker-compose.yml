@@ -31,6 +31,8 @@ services:
     environment:
       DATABASE_URL: postgres://agent_bridge:agent_bridge@postgres:5432/agent_bridge
       RELAY_ORIGIN: http://127.0.0.1:8080
+      # Local only. The relay refuses this secret when NODE_ENV=production.
+      NODE_ENV: development
       RELAY_TOKEN_SECRET: dev-only-secret-change-me-dev-only-secret
       HOST: 0.0.0.0
       PORT: "8080"

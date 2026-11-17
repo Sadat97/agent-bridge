@@ -8,11 +8,16 @@ import {
   verifyDeviceCert,
   verifyWithLabel,
 } from '@agent-bridge/protocol';
-import { issueAccessToken, loadDevice, nowSeconds, requireDevice } from '../auth.ts';
+import { issueAccessToken, loadDevice, lockLiveDevice, nowSeconds, requireDevice } from '../auth.ts';
 import type { RelayContext } from '../context.ts';
 import { bytes, withTransaction } from '../db.ts';
-import { badRequest, conflict, notFound, unauthorized } from '../errors.ts';
+import type { Queryable } from '../db.ts';
+import { badRequest, conflict, notFound, tooManyRequests, unauthorized } from '../errors.ts';
 import { base64Schema, decodeBase64Field, parseUuid, uniqueViolation, uuidSchema } from '../validate.ts';
+
+async function deleteExpiredChallenges(db: Queryable, now: Date): Promise<void> {
+  await db.query('DELETE FROM auth_challenges WHERE expires_at <= $1', [now]);
+}
 
 interface RegisterBody {
   handle: string;
@@ -137,14 +142,33 @@ export function identityRoutes(app: FastifyInstance, ctx: RelayContext): void {
     },
     async (request) => {
       const deviceId = parseUuid('device_id', request.body.device_id);
-      if (!(await loadDevice(ctx.pool, deviceId))) throw notFound('device unknown or revoked');
+      const clientIp = request.ip || 'unknown';
+      const now = ctx.now();
       const nonce = randomBytes(32);
-      const expiresAt = new Date(ctx.now().getTime() + ctx.config.challengeTtlSeconds * 1000);
-      await ctx.pool.query('INSERT INTO auth_challenges (nonce, device_id, expires_at) VALUES ($1, $2, $3)', [
-        nonce,
-        deviceId,
-        expiresAt,
-      ]);
+      const expiresAt = new Date(now.getTime() + ctx.config.challengeTtlSeconds * 1000);
+      await withTransaction(ctx.pool, async (db) => {
+        await deleteExpiredChallenges(db, now);
+        // Serialize issuers that share an address, then the device row, so the caps cannot race.
+        await db.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [`challenge:${clientIp}`]);
+        if (!(await lockLiveDevice(db, deviceId))) throw notFound('device unknown or revoked');
+        const outstanding = async (where: string, value: string) => {
+          const { rows } = await db.query<{ n: number }>(
+            `SELECT count(*)::int AS n FROM auth_challenges WHERE ${where} AND used_at IS NULL AND expires_at > $2`,
+            [value, now],
+          );
+          return rows[0]!.n;
+        };
+        if ((await outstanding('device_id = $1', deviceId)) >= ctx.config.maxOutstandingChallengesPerDevice) {
+          throw tooManyRequests('too many outstanding challenges for this device');
+        }
+        if ((await outstanding('client_ip = $1', clientIp)) >= ctx.config.maxOutstandingChallengesPerIp) {
+          throw tooManyRequests('too many outstanding challenges from this client');
+        }
+        await db.query(
+          'INSERT INTO auth_challenges (nonce, device_id, expires_at, client_ip) VALUES ($1, $2, $3, $4)',
+          [nonce, deviceId, expiresAt, clientIp],
+        );
+      });
       return { nonce: toBase64(nonce), expires_at: expiresAt.toISOString() };
     },
   );
@@ -165,6 +189,7 @@ export function identityRoutes(app: FastifyInstance, ctx: RelayContext): void {
       const deviceId = parseUuid('device_id', request.body.device_id);
       const nonce = decodeBase64Field('nonce', request.body.nonce, 32);
       const signature = decodeBase64Field('signature', request.body.signature, 64);
+      await deleteExpiredChallenges(ctx.pool, ctx.now());
 
       // Consume the challenge first: a wrong signature still burns it.
       const used = await ctx.pool.query(

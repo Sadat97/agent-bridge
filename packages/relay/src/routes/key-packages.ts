@@ -75,16 +75,24 @@ export function keyPackageRoutes(app: FastifyInstance, ctx: RelayContext): void 
         return { message, ref: keyPackageRef(summary.keyPackage), cipherSuite: summary.cipherSuite };
       });
 
-      let accepted = 0;
-      for (const kp of parsed) {
-        const result = await ctx.pool.query(
-          `INSERT INTO key_packages (device_id, ciphersuite, key_package_ref, key_package, expires_at)
-           VALUES ($1, $2, $3, $4, $5) ON CONFLICT (key_package_ref) DO NOTHING`,
-          [device.id, kp.cipherSuite, kp.ref, kp.message, expiresAt],
-        );
-        accepted += result.rowCount ?? 0;
-      }
-      return { accepted, unclaimed: await unclaimedCount(ctx.pool, device.id, now) };
+      return withTransaction(ctx.pool, async (db) => {
+        if (!(await lockLiveDevice(db, device.id))) throw unauthorized('device unknown or revoked');
+        let room = ctx.config.maxUnclaimedKeyPackages - (await unclaimedCount(db, device.id, now));
+        if (room <= 0) throw tooManyRequests('too many unclaimed KeyPackages');
+        let accepted = 0;
+        for (const kp of parsed) {
+          if (room <= 0) break;
+          const result = await db.query(
+            `INSERT INTO key_packages (device_id, ciphersuite, key_package_ref, key_package, expires_at)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (key_package_ref) DO NOTHING`,
+            [device.id, kp.cipherSuite, kp.ref, kp.message, expiresAt],
+          );
+          const inserted = result.rowCount ?? 0;
+          accepted += inserted;
+          room -= inserted;
+        }
+        return { accepted, unclaimed: await unclaimedCount(db, device.id, now) };
+      });
     },
   );
 

@@ -38,6 +38,45 @@ export async function loadMembership(
   return rows[0] ?? null;
 }
 
+/**
+ * Move a member's fetch cursor under the topic lock, and clear `stale_at` once
+ * the cursor is no longer behind the retained prefix. `caughtUpOnly` is the
+ * sender case: the cursor advances only from `seq - 1`, so a member who was
+ * already behind does not skip the gap.
+ */
+export async function noteCursor(
+  db: Queryable,
+  topicId: string,
+  deviceId: string,
+  seq: number,
+  opts: { caughtUpOnly?: boolean } = {},
+): Promise<void> {
+  await db.query('SELECT 1 FROM topics WHERE id = $1 FOR UPDATE', [topicId]);
+  if (opts.caughtUpOnly) {
+    await db.query(
+      `UPDATE topic_members m
+          SET last_fetched_seq = $3,
+              stale_at = CASE WHEN $3 >= t.pruned_through_seq THEN NULL ELSE m.stale_at END
+         FROM topics t
+        WHERE t.id = m.topic_id AND m.topic_id = $1 AND m.device_id = $2
+          AND m.removed_at IS NULL AND m.last_fetched_seq = $3 - 1`,
+      [topicId, deviceId, seq],
+    );
+    return;
+  }
+  await db.query(
+    `UPDATE topic_members m
+        SET last_fetched_seq = GREATEST(m.last_fetched_seq, LEAST($3::bigint, t.last_seq)),
+            stale_at = CASE
+              WHEN GREATEST(m.last_fetched_seq, LEAST($3::bigint, t.last_seq)) >= t.pruned_through_seq THEN NULL
+              ELSE m.stale_at
+            END
+       FROM topics t
+      WHERE t.id = m.topic_id AND m.topic_id = $1 AND m.device_id = $2 AND m.removed_at IS NULL`,
+    [topicId, deviceId, seq],
+  );
+}
+
 async function topicViews(db: Queryable, deviceId: string, topicId?: string) {
   const { rows: topics } = await db.query<{
     id: string;

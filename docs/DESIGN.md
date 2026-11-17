@@ -569,7 +569,7 @@ There is no `topic_state`, `invites`, or `refresh_tokens` table. Shared state ex
 
 Added during implementation (milestone 2): `auth_challenges` (single-use login nonces), `topics.pruned_through_seq` (the retention watermark; a fetch cursor behind it gets 410), and `key_packages.claim_topic_id` + `claim_approval_id` (a retried claim for the same topic and approval returns the same KeyPackage; `approval_id` is only unique per topic). The schema of record is `packages/relay/migrations/`.
 
-**Retention (decision 11.1):** `mls_messages` rows are deleted 30 days after `created_at`; unacked `welcomes` after 7 days. A member whose `last_fetched_seq` falls behind the oldest retained seq is marked `stale_at` (it would miss commits and can no longer follow the group) and the topic owner's bridge is notified to re-add it.
+**Retention (decision 11.1):** `mls_messages` rows are deleted 30 days after `created_at`; unacked `welcomes` after 7 days. A member whose `last_fetched_seq` falls behind the oldest retained seq is marked `stale_at` (it would miss commits and can no longer follow the group) and the topic owner's bridge is notified to re-add it. Retention and cursor updates take the topic lock together, and `stale_at` is cleared when `last_fetched_seq` is no longer behind `pruned_through_seq`. A stale topic-owner device may still post a membership commit so it can do that re-add (5.7); its other posts stay rejected.
 
 ### 4.2 Bridge local store (SQLite, per person)
 
@@ -818,7 +818,7 @@ sequenceDiagram
 - **Leave:** the person runs `agb topic leave` (human-only). The bridge posts `leave`; the topic owner's bridge commits the Remove automatically, citing the leave message's seq. No identity signature is needed; members check that the leave came from that member.
 - **Topic owner** cannot leave in MVP; `agb topic close` closes the topic (relay rejects new messages; data purged by retention).
 - **Key rotation:** each bridge commits a self-Update if it has not committed in 7 days, and after any suspected compromise.
-- **Stale member re-add:** when the relay reports a member as stale, the topic owner gets a `remove` + `invite` approval pair to re-add that person, who then receives a fresh snapshot.
+- **Stale member re-add:** when the relay reports a member as stale, the topic owner gets a `remove` + `invite` approval pair to re-add that person, who then receives a fresh snapshot. The relay accepts that membership commit from the topic owner's device even when that device is itself stale.
 
 A topic's status on a bridge (`topics.status` in section 4.2):
 

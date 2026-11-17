@@ -24,7 +24,7 @@ import { bytes, withTransaction } from '../db.ts';
 import { deliver } from '../deliver.ts';
 import { badRequest, conflict, forbidden, gone, notFound, RelayError, tooManyRequests, unauthorized } from '../errors.ts';
 import { approvalIdSchema, base64Schema, decodeBase64Field, parseUuid, uuidSchema } from '../validate.ts';
-import { loadMembership } from './topics.ts';
+import { loadMembership, noteCursor } from './topics.ts';
 
 interface PostBody {
   message: string;
@@ -203,7 +203,9 @@ export function messageRoutes(app: FastifyInstance, ctx: RelayContext): void {
         const m = await loadMembership(db, topicId, device.id, { lockTopic: true });
         if (!m) throw notFound();
         if (m.closed_at) throw conflict('topic_closed', 'the topic is closed');
-        if (m.stale_at) throw forbidden('member_stale', 'this device fell behind retention and must be re-added');
+        // A stale topic owner can still commit the section 5.7 re-add. Other posts cannot.
+        const readd = m.role === 'owner' && isCommit && adds.length + removes.length > 0;
+        if (m.stale_at && !readd) throw forbidden('member_stale', 'this device fell behind retention and must be re-added');
         if (epoch !== m.current_epoch) {
           throw conflict('stale_epoch', `the topic is at epoch ${m.current_epoch}`, { current_epoch: m.current_epoch });
         }
@@ -293,10 +295,7 @@ export function messageRoutes(app: FastifyInstance, ctx: RelayContext): void {
         );
         await db.query('UPDATE topics SET last_seq = $2, current_epoch = $3 WHERE id = $1', [topicId, seq, newEpoch]);
         // A sender that was caught up now also has its own message.
-        await db.query(
-          'UPDATE topic_members SET last_fetched_seq = $3 WHERE topic_id = $1 AND device_id = $2 AND last_fetched_seq = $3 - 1',
-          [topicId, device.id, seq],
-        );
+        await noteCursor(db, topicId, device.id, seq, { caughtUpOnly: true });
 
         for (const r of removes) {
           await db.query('UPDATE topic_members SET removed_at = $3 WHERE topic_id = $1 AND device_id = $2', [
@@ -389,47 +388,53 @@ export function messageRoutes(app: FastifyInstance, ctx: RelayContext): void {
     async (request) => {
       const device = request.device;
       const topicId = parseUuid('id', request.params.id);
-      const m = await loadMembership(ctx.pool, topicId, device.id);
-      if (!m) throw notFound();
-      if (m.stale_at) throw forbidden('member_stale', 'this device fell behind retention and must be re-added');
+      return withTransaction(ctx.pool, async (db) => {
+        const m = await loadMembership(db, topicId, device.id, { lockTopic: true });
+        if (!m) throw notFound();
+        // stale_at means the cursor is behind the pruned prefix. A cursor that
+        // has since caught up (under this same lock) is not stale.
+        if (m.last_fetched_seq >= m.pruned_through_seq && m.stale_at) {
+          await db.query('UPDATE topic_members SET stale_at = NULL WHERE topic_id = $1 AND device_id = $2', [
+            topicId,
+            device.id,
+          ]);
+        }
+        if (m.last_fetched_seq < m.pruned_through_seq) {
+          throw forbidden('member_stale', 'this device fell behind retention and must be re-added');
+        }
 
-      // A member never receives ciphertext from before it joined.
-      const after = Math.max(request.query.after_seq ?? m.joined_seq, m.joined_seq);
-      if (after < m.pruned_through_seq) {
-        throw gone('pruned', 'messages after this cursor were deleted by retention', { min_seq: m.pruned_through_seq + 1 });
-      }
+        // A member never receives ciphertext from before it joined.
+        const after = Math.max(request.query.after_seq ?? m.joined_seq, m.joined_seq);
+        if (after < m.pruned_through_seq) {
+          throw gone('pruned', 'messages after this cursor were deleted by retention', { min_seq: m.pruned_through_seq + 1 });
+        }
 
-      const { rows } = await ctx.pool.query<{
-        seq: number;
-        epoch: number;
-        content: 'commit' | 'application';
-        sender_device: string;
-        message: Buffer;
-        created_at: Date;
-      }>(
-        `SELECT seq, epoch, content, sender_device, message, created_at FROM mls_messages
-          WHERE topic_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`,
-        [topicId, after, request.query.limit ?? 100],
-      );
-      const last = rows.at(-1);
-      if (last) {
-        await ctx.pool.query(
-          `UPDATE topic_members SET last_fetched_seq = GREATEST(last_fetched_seq, $3)
-            WHERE topic_id = $1 AND device_id = $2`,
-          [topicId, device.id, last.seq],
+        const { rows } = await db.query<{
+          seq: number;
+          epoch: number;
+          content: 'commit' | 'application';
+          sender_device: string;
+          message: Buffer;
+          created_at: Date;
+        }>(
+          `SELECT seq, epoch, content, sender_device, message, created_at FROM mls_messages
+            WHERE topic_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`,
+          [topicId, after, request.query.limit ?? 100],
         );
-      }
-      return {
-        messages: rows.map((r) => ({
-          seq: r.seq,
-          epoch: r.epoch,
-          content: r.content,
-          sender_device: r.sender_device,
-          message: toBase64(bytes(r.message)),
-          created_at: r.created_at.toISOString(),
-        })),
-        last_seq: Math.max(m.last_seq, last?.seq ?? 0),
-      };
+        const last = rows.at(-1);
+        if (last) await noteCursor(db, topicId, device.id, last.seq);
+        return {
+          messages: rows.map((r) => ({
+            seq: r.seq,
+            epoch: r.epoch,
+            content: r.content,
+            sender_device: r.sender_device,
+            message: toBase64(bytes(r.message)),
+            created_at: r.created_at.toISOString(),
+          })),
+          last_seq: Math.max(m.last_seq, last?.seq ?? 0),
+        };
+      });
     },
   );
 }

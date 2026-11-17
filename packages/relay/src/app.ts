@@ -35,7 +35,7 @@ export async function buildApp(opts: BuildOptions): Promise<{ app: FastifyInstan
     logger: opts.logger ?? false,
     // A commit and its Welcome, base64-encoded, plus JSON overhead.
     bodyLimit: Math.ceil((opts.config.maxMessageBytes * 2 * 4) / 3) + 64 * 1024,
-    trustProxy: true,
+    trustProxy: opts.config.trustProxy,
   });
 
   // Client-to-server WebSocket frames are only acks and pings.
