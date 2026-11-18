@@ -1360,9 +1360,10 @@ export class Bridge {
   }
 
   /**
-   * One timer, aimed at the soonest stored deadline. Overdue topics are not
-   * scheduled: startup's runDueSelfUpdates already commits those immediately.
-   * setTimeout accepts the 7-day delay (it is under 2^31-1 ms).
+   * One timer for the soonest stored deadline. The sleep passed to setTimeout
+   * is capped at 24 hours and at 2^31-1 ms. A wake before the deadline reads
+   * the stored clock again. Overdue topics are not scheduled here: startup
+   * already commits those.
    */
   #armSelfUpdateTimer(): void {
     if (this.#selfUpdateTimer) clearTimeout(this.#selfUpdateTimer);

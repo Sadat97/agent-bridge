@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { MlsStore, TopicSession, createTsMlsEngine } from '@agent-bridge/mls';
 import type { PersistedFrame } from '@agent-bridge/mls';
+import { generateEd25519KeyPair, issueDeviceCert } from '@agent-bridge/protocol';
 import { hashBytes, hashLabel } from '../src/json.ts';
 import { AesGcmSealer, randomStorageKey } from '../src/seal.ts';
 import { LocalStore, scrubPlaintext } from '../src/local.ts';
@@ -93,6 +96,16 @@ describe('envelope plaintext at rest', () => {
          approval_id, topic_id, kind, status, requested_by, summary, request_json, created_at
        ) VALUES ('apr_old', 'topic-1', 'request', 'pending', 'ada/cli', ?, ?, '2026-11-01T00:00:00.000Z')`,
     ).run('approval-summary-plaintext-9f3c2a', JSON.stringify({ body: 'approval-request-plaintext-9f3c2a' }));
+    db.exec(`CREATE TABLE pending_outbound (
+      topic_id TEXT PRIMARY KEY,
+      message BLOB NOT NULL,
+      welcome BLOB,
+      mls_state BLOB NOT NULL,
+      manifest_json TEXT NOT NULL
+    )`);
+    db.prepare(
+      `INSERT INTO pending_outbound (topic_id, message, mls_state, manifest_json) VALUES ('topic-1', x'00', x'00', ?)`,
+    ).run(JSON.stringify({ body: 'staged-send-plaintext-9f3c2a', payload: { note: 'staged-payload-plaintext-9f3c2a' } }));
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     db.close();
 
@@ -103,6 +116,8 @@ describe('envelope plaintext at rest', () => {
     expect(storeBytes(path).includes(Buffer.from('shared-state-plaintext-9f3c2a'))).toBe(false);
     expect(storeBytes(path).includes(Buffer.from('approval-summary-plaintext-9f3c2a'))).toBe(false);
     expect(storeBytes(path).includes(Buffer.from('approval-request-plaintext-9f3c2a'))).toBe(false);
+    expect(storeBytes(path).includes(Buffer.from('staged-send-plaintext-9f3c2a'))).toBe(false);
+    expect(storeBytes(path).includes(Buffer.from('staged-payload-plaintext-9f3c2a'))).toBe(false);
 
     const local = new LocalStore(path, { sealer });
     expect(local.envelopes('topic-1', 0, 10)[0]).toMatchObject({ body: MARKER, payload: { note: PAYLOAD } });
@@ -140,6 +155,38 @@ describe('envelope plaintext at rest', () => {
     expect(afterDelete.includes(Buffer.from('shared-state-plaintext-9f3c2a'))).toBe(false);
     expect(afterDelete.includes(Buffer.from('approval-summary-plaintext-9f3c2a'))).toBe(false);
     expect(afterDelete.includes(Buffer.from('approval-request-plaintext-9f3c2a'))).toBe(false);
+    expect(afterDelete.includes(Buffer.from('staged-send-plaintext-9f3c2a'))).toBe(false);
+    expect(afterDelete.includes(Buffer.from('staged-payload-plaintext-9f3c2a'))).toBe(false);
+  });
+
+  it('keeps a staged send that never reached the relay sealed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agb-staged-'));
+    const path = join(dir, 'store.sqlite');
+    const sealer = new AesGcmSealer(randomStorageKey());
+    const identity = generateEd25519KeyPair();
+    const device = generateEd25519KeyPair();
+    const deviceId = randomUUID();
+    const cert = issueDeviceCert(identity.privateKey, {
+      handle: 'ada',
+      deviceId,
+      signatureKey: device.publicKey,
+      createdAt: 1_700_000_000,
+    });
+    const mls = new MlsStore(path, { sealer });
+    const engine = createTsMlsEngine({ devicePrivateKey: device.privateKey, pins: mls.pins });
+    const topicId = randomUUID();
+    const session = await TopicSession.create({
+      store: mls,
+      engine,
+      topicId,
+      credential: { handle: 'ada', identityKey: identity.publicKey, deviceId, deviceCert: cert },
+    });
+    await session.stageMessage({ type: 'update', body: 'staged-live-plaintext-9f3c2a' });
+    mls.close();
+    expect(storeBytes(path).includes(Buffer.from('staged-live-plaintext-9f3c2a'))).toBe(false);
+    const again = new MlsStore(path, { sealer });
+    expect(again.pending(topicId)?.manifestJson).toContain('staged-live-plaintext-9f3c2a');
+    again.close();
   });
 
   it('keeps JSON Patch compare-and-swap working when the document is sealed', () => {

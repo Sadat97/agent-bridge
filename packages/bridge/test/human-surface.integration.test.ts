@@ -319,7 +319,19 @@ describe('human surface', () => {
     const saved = alice.local.contact('bob');
     expect(saved).toBeDefined();
     alice.local.db.prepare('DELETE FROM contacts WHERE handle = ?').run('bob');
-    await alice.syncAll();
+    let claims = 0;
+    const client = alice.relay;
+    const original = client.claim.bind(client);
+    client.claim = async (deviceId, body) => {
+      claims += 1;
+      return original(deviceId, body);
+    };
+    try {
+      await alice.syncAll();
+    } finally {
+      client.claim = original;
+    }
+    expect(claims).toBe(0);
     expect(alice.local.approval(invite.approval_id!)?.status).toBe('pending');
     alice.mls.pinIdentity({ handle: 'bob', identityKey: saved!.identityKey });
     await alice.verifyContact('bob', fingerprint(saved!.identityKey), PASSPHRASE);

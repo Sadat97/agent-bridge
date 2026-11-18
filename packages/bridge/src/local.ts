@@ -6,6 +6,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, unlinkSync } from 'node:fs';
 import { bytesEqual, fromUtf8, utf8 } from '@agent-bridge/protocol';
+import { pendingManifestAad } from '@agent-bridge/mls';
 import type { Envelope, PersistedFrame, SecretSealer, StoreDb } from '@agent-bridge/mls';
 import { BridgeError } from './errors.ts';
 import { applyPatch, hashBytes, parseHashLabel } from './json.ts';
@@ -547,6 +548,18 @@ export class LocalStore {
     const updateState = this.db.prepare(
       'UPDATE topic_state SET doc_json = \'\', doc_sealed = ? WHERE topic_id = ? AND version = ?',
     );
+    const pendingCols = columnSet(this.db, 'pending_outbound');
+    if (pendingCols.size > 0 && !pendingCols.has('manifest_sealed')) {
+      this.db.exec('ALTER TABLE pending_outbound ADD COLUMN manifest_sealed BLOB');
+    }
+    const pendingRows =
+      pendingCols.size === 0
+        ? []
+        : this.db.prepare('SELECT topic_id, manifest_json, manifest_sealed FROM pending_outbound').all();
+    const updatePending =
+      pendingCols.size === 0
+        ? undefined
+        : this.db.prepare('UPDATE pending_outbound SET manifest_json = \'\', manifest_sealed = ? WHERE topic_id = ?');
     const approvalRows = this.db
       .prepare('SELECT approval_id, summary, request_json, summary_sealed, request_sealed FROM approvals')
       .all();
@@ -579,6 +592,14 @@ export class LocalStore {
         const topicId = String(row.topic_id);
         const version = Number(row.version);
         updateState.run(this.#sealText(json, stateAad(topicId, version)), topicId, version);
+        migrated += 1;
+      }
+      for (const row of pendingRows) {
+        if (row.manifest_sealed != null) continue;
+        const json = row.manifest_json === null || row.manifest_json === undefined ? '' : String(row.manifest_json);
+        if (json === '') continue;
+        const topicId = String(row.topic_id);
+        updatePending!.run(this.#sealText(json, pendingManifestAad(topicId)), topicId);
         migrated += 1;
       }
       for (const row of approvalRows) {
