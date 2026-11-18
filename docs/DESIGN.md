@@ -575,7 +575,7 @@ Added during implementation (milestone 2): `auth_challenges` (single-use login n
 
 Path: `~/.agent-bridge/store.sqlite`. Keys, MLS state, envelope plaintext, and shared-state documents are wrapped at the application level (AES-256-GCM). SQLCipher is a later option for the whole file.
 
-**At-rest wrapping.** `storage.key` (mode 0600) is 32 random bytes. It seals the device private key, every saved MLS state (confirmed and staged), KeyPackage private material, envelope plaintext, and the shared-state document with AES-256-GCM. Associated data binds each ciphertext to its row (`envelope-body:<topic_id>:<seq>`, `envelope-payload:<topic_id>:<seq>`, and `topic-state:<topic_id>:<version>`), so a blob copied onto another row does not open. Connections set `secure_delete`. On open, before the MLS connection is created, leftover plaintext rows are sealed and the file is rebuilt with `VACUUM`; the WAL, shared-memory, and rollback-journal sidecars are then removed, so free pages do not keep the old bytes. The identity private key is not under that key: a passphrase is stretched with Argon2id (time 2, memory 19 MiB, parallelism 1) and the seed is sealed with a fresh salt and nonce, then zeroed after the one approval that opened it. Copying `store.sqlite` without `storage.key` does not yield those secrets.
+**At-rest wrapping.** `storage.key` (mode 0600) is 32 random bytes. It seals the device private key, every saved MLS state (confirmed and staged), KeyPackage private material, envelope plaintext, the shared-state document, and approval `summary` / `request_json` with AES-256-GCM. Associated data binds each ciphertext to its row (`envelope-body:<topic_id>:<seq>`, `envelope-payload:<topic_id>:<seq>`, `topic-state:<topic_id>:<version>`, `approval:<approval_id>:summary`, and `approval:<approval_id>:request`), so a blob copied onto another row does not open. Connections set `secure_delete`. On open, before the MLS connection is created, leftover plaintext rows are sealed and the file is rebuilt with `VACUUM`; the WAL, shared-memory, and rollback-journal sidecars are then removed, so free pages do not keep the old bytes. The identity private key is not under that key: a passphrase is stretched with Argon2id (time 2, memory 19 MiB, parallelism 1) and the seed is sealed with a fresh salt and nonce, then zeroed after the one approval that opened it. Copying `store.sqlite` without `storage.key` does not yield those secrets. Handles, identity and device public keys, token hashes, cursors, and membership times stay unsealed; they are not message or document plaintext.
 
 ```sql
 CREATE TABLE identity (
@@ -659,8 +659,10 @@ CREATE TABLE approvals (
   kind              TEXT NOT NULL,                -- invite | remove | join | request | state_change
   status            TEXT NOT NULL,                -- pending | approved | rejected | expired | done
   requested_by      TEXT NOT NULL,                -- "<handle>/<agent_label>"
-  summary           TEXT NOT NULL,
-  request_json      TEXT NOT NULL,
+  summary           TEXT NOT NULL DEFAULT '',     -- empty once sealed
+  request_json      TEXT NOT NULL DEFAULT '',     -- empty once sealed
+  summary_sealed    BLOB,                         -- AES-256-GCM, AAD approval:<approval_id>:summary
+  request_sealed    BLOB,                         -- AES-256-GCM, AAD approval:<approval_id>:request
   created_at        TEXT NOT NULL,
   decided_at        TEXT
 );
@@ -820,7 +822,7 @@ sequenceDiagram
 - **Remove:** an agent calls `remove_member` → `removal_proposal` (or a local approval if its person is the topic owner) → the topic owner approves (passphrase) → `remove` approval → the topic owner's bridge commits Remove with the approval in `authenticated_data`. The relay stops fanout to the removed device; the new epoch is the cryptographic enforcement.
 - **Leave:** the person runs `agb topic leave` (human-only). The bridge posts `leave`; the topic owner's bridge commits the Remove automatically, citing the leave message's seq. No identity signature is needed; members check that the leave came from that member.
 - **Topic owner** cannot leave in MVP; `agb topic close` closes the topic (relay rejects new messages; data purged by retention).
-- **Key rotation:** each bridge commits a self-Update if it has not committed in 7 days, and after any suspected compromise. The daemon stores the time of its last commit per topic. On startup it commits immediately when that deadline has passed (a missing clock counts as passed). Otherwise it sets one timer for the exact next deadline and recomputes that timer after every commit. If the commit fails, the deadline stays in the past and the daemon tries again 30 seconds later. The unpublished-generation cap (32) still forces a self-Update earlier (section 5.8).
+- **Key rotation:** each bridge commits a self-Update if it has not committed in 7 days, and after any suspected compromise. The daemon stores the time of its last commit per topic. On startup it commits immediately when that deadline has passed (a missing clock counts as passed). Otherwise it sets one timer for the exact next deadline and recomputes that timer after every commit. Each sleep is at most 24 hours, and never above the 2^31−1 ms limit of `setTimeout`; a wake before the deadline reads the stored clock again. A `last_commit_at` ahead of the wall clock is clamped to now. If the commit fails, the deadline stays in the past and the daemon tries again 30 seconds later. The unpublished-generation cap (32) still forces a self-Update earlier (section 5.8).
 - **Stale member re-add:** when the relay reports a member as stale, the topic owner gets a `remove` + `invite` approval pair to re-add that person, who then receives a fresh snapshot. The relay accepts that membership commit from the topic owner's device even when that device is itself stale.
 
 A topic's status on a bridge (`topics.status` in section 4.2):
@@ -1592,8 +1594,8 @@ This is comparable to any unsealed-sender group messenger. Hiding membership and
 | --- | --- | --- |
 | 11 | Fingerprint display | 60-digit safety number, 12 groups of 5, plus QR payload `agbfp:v1:<digits>`. `agb contact verify` accepts either. |
 | 12 | MCP implementation | `@modelcontextprotocol/sdk` on the loopback server. Tools, token scope, and error text stay as in section 6.2. |
-| 13 | Weekly self-Update | Persisted per-topic commit clock. Overdue (or missing) on startup commits immediately. Otherwise one timer fires at the exact next deadline and is recomputed after every commit. The 32-generation cap still applies. |
-| 14 | Plaintext at rest | Envelope body and payload, and the shared-state document, are sealed with `storage.key` (AES-256-GCM, row associated data), including rows already on disk. `secure_delete` is on. Opening the store rebuilds the file and removes WAL and journal sidecars so free pages do not keep the old bytes. Compare-and-swap still uses version and doc hash. |
+| 13 | Weekly self-Update | Persisted per-topic commit clock. Overdue (or missing) on startup commits immediately. Otherwise one timer fires at the exact next deadline and is recomputed after every commit. Each sleep is at most 24 hours (and never above 2^31−1 ms), and the wake reads the stored clock again. A `last_commit_at` in the future is clamped to now. A failed commit retries 30 seconds later. The 32-generation cap still applies. |
+| 14 | Plaintext at rest | Envelope body and payload, the shared-state document, and approval summary and request JSON are sealed with `storage.key` (AES-256-GCM, distinct row associated data), including rows already on disk. `secure_delete` is on. Opening the store rebuilds the file and removes WAL and journal sidecars so free pages do not keep the old bytes. Compare-and-swap still uses version and doc hash. |
 | 15 | Pinned key change | Loud, pin unchanged until `agb contact verify` of the new fingerprint. Adds are blocked until then. A current member is recovered by remove, then re-add. |
 
 ---

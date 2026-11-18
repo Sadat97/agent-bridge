@@ -185,15 +185,17 @@ describe('two bridges on a local relay', () => {
     expect(pending.items.some((item) => item.approval_id === invite.approval_id)).toBe(true);
     const db = new DatabaseSync(alice.paths.sqlite, { readOnly: true });
     try {
-      const row = db.prepare('SELECT request_json FROM approvals WHERE approval_id = ?').get(invite.approval_id!) as
-        | { request_json: string }
+      const row = db.prepare('SELECT summary, request_json FROM approvals WHERE approval_id = ?').get(invite.approval_id!) as
+        | { summary: string; request_json: string }
         | undefined;
-      const request = JSON.parse(row?.request_json ?? '{}') as { expiresAt?: number };
-      expect(request.expiresAt).toBeTypeOf('number');
-      expect(request.expiresAt! - Math.floor(Date.now() / 1000)).toBeGreaterThan(6 * 24 * 60 * 60);
+      expect(row?.summary).toBe('');
+      expect(row?.request_json).toBe('');
     } finally {
       db.close();
     }
+    const request = alice.local.approval(invite.approval_id!)?.request as { expiresAt?: number };
+    expect(request.expiresAt).toBeTypeOf('number');
+    expect(request.expiresAt! - Math.floor(Date.now() / 1000)).toBeGreaterThan(6 * 24 * 60 * 60);
     await bob.syncAll();
     await alice.syncAll();
     const join = await waitFor(async () => {

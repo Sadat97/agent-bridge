@@ -7,7 +7,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { generateEd25519KeyPair } from '@agent-bridge/protocol';
 import { ORIGIN, startRelay } from '../../relay/test/helpers.ts';
 import type { TestRelay } from '../../relay/test/helpers.ts';
-import { Bridge, SELF_UPDATE_INTERVAL_MS, fingerprint, fingerprintQrPayload, initBridge, openBridge } from '../src/index.ts';
+import {
+  Bridge,
+  SELF_UPDATE_INTERVAL_MS,
+  SELF_UPDATE_WAKE_CAP_MS,
+  fingerprint,
+  fingerprintQrPayload,
+  initBridge,
+  openBridge,
+} from '../src/index.ts';
 import type { AgentCaller } from '../src/index.ts';
 
 const PASSPHRASE = 'test-passphrase-1';
@@ -302,6 +310,22 @@ describe('human surface', () => {
     expect(pty.stdout).toContain('bob');
   }, 40_000);
 
+  it('does not claim a stored invite when the trust check fails', async () => {
+    await relay.pool.query('DELETE FROM key_packages WHERE device_id = $1', [bob.config.deviceId]);
+    const created = await alice.createTopic(cli, { slug: 'retry-trust', title: 'Retry trust' });
+    const invite = await alice.inviteMember(cli, created.topic_id, 'bob');
+    const decided = await alice.approve(invite.approval_id!, PASSPHRASE);
+    expect(decided.status).toBe('pending');
+    const saved = alice.local.contact('bob');
+    expect(saved).toBeDefined();
+    alice.local.db.prepare('DELETE FROM contacts WHERE handle = ?').run('bob');
+    await alice.syncAll();
+    expect(alice.local.approval(invite.approval_id!)?.status).toBe('pending');
+    alice.mls.pinIdentity({ handle: 'bob', identityKey: saved!.identityKey });
+    await alice.verifyContact('bob', fingerprint(saved!.identityKey), PASSPHRASE);
+    await bob.syncAll();
+  });
+
   it('self-updates when the stored commit clock is 7 days old, including after a restart', async () => {
     alice.local.noteCommit(topicId, Date.now() - SELF_UPDATE_INTERVAL_MS - 1000);
     expect(await alice.runDueSelfUpdates()).toContain(topicId);
@@ -342,6 +366,19 @@ describe('human surface', () => {
     const next = alice.nextSelfUpdateAt();
     expect(next).toBeDefined();
     expect(next! - Date.now()).toBeGreaterThan(SELF_UPDATE_INTERVAL_MS - 15_000);
+    expect(alice.selfUpdateWakeDelay()!).toBeLessThanOrEqual(SELF_UPDATE_WAKE_CAP_MS);
+    expect(alice.selfUpdateWakeDelay()!).toBe(SELF_UPDATE_WAKE_CAP_MS);
+
+    const future = Date.now() + 40 * 24 * 60 * 60 * 1000;
+    alice.local.noteCommit(topicId, future);
+    const clamped = alice.rescheduleSelfUpdates();
+    expect(alice.local.lastCommitAt(topicId)!).toBeLessThanOrEqual(Date.now());
+    expect(clamped! - Date.now()).toBeLessThanOrEqual(SELF_UPDATE_INTERVAL_MS);
+    expect(clamped! - Date.now()).toBeGreaterThan(SELF_UPDATE_INTERVAL_MS - 5_000);
+    expect(alice.selfUpdateWakeDelay()).toBe(SELF_UPDATE_WAKE_CAP_MS);
+
+    alice.local.noteCommit(topicId, Date.now() - SELF_UPDATE_INTERVAL_MS - 1_000);
+    expect(await alice.runDueSelfUpdates()).toContain(topicId);
     await bob.syncAll();
     expect((await bob.readMessages(cli, { topicId, sinceSeq: 0 })).messages).toContainEqual(
       expect.objectContaining({ body: 'after the weekly update' }),

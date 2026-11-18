@@ -91,8 +91,10 @@ CREATE TABLE IF NOT EXISTS approvals (
   kind TEXT NOT NULL,
   status TEXT NOT NULL,
   requested_by TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  request_json TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  request_json TEXT NOT NULL DEFAULT '',
+  summary_sealed BLOB,
+  request_sealed BLOB,
   created_at TEXT NOT NULL,
   decided_at TEXT
 );
@@ -338,23 +340,35 @@ export class LocalStore {
     summary: string;
     request: unknown;
   }): void {
+    const sealed = this.#sealApproval(row.approvalId, row.summary, JSON.stringify(row.request));
     this.db
       .prepare(
         `INSERT INTO approvals (
-           approval_id, topic_id, kind, status, requested_by, summary, request_json, created_at
-         ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`,
+           approval_id, topic_id, kind, status, requested_by, summary, request_json,
+           summary_sealed, request_sealed, created_at
+         ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
       )
-      .run(row.approvalId, row.topicId, row.kind, row.requestedBy, row.summary, JSON.stringify(row.request), new Date().toISOString());
+      .run(
+        row.approvalId,
+        row.topicId,
+        row.kind,
+        row.requestedBy,
+        sealed.summary,
+        sealed.requestJson,
+        sealed.summarySealed,
+        sealed.requestSealed,
+        new Date().toISOString(),
+      );
   }
 
   approval(id: string): ApprovalRow | undefined {
     const row = this.db.prepare('SELECT * FROM approvals WHERE approval_id = ?').get(id);
-    return row ? approvalRow(row) : undefined;
+    return row ? this.#approvalFrom(row) : undefined;
   }
 
   approvals(topicIds: '*' | string[], status: string): ApprovalRow[] {
     const rows = this.db.prepare('SELECT * FROM approvals ORDER BY created_at').all();
-    return rows.map(approvalRow).filter((row) => {
+    return rows.map((row) => this.#approvalFrom(row)).filter((row) => {
       if (status !== 'all' && row.status !== status) return false;
       if (topicIds === '*') return true;
       return topicIds.includes(row.topicId);
@@ -362,7 +376,14 @@ export class LocalStore {
   }
 
   updateRequest(id: string, request: unknown): void {
-    this.db.prepare('UPDATE approvals SET request_json = ? WHERE approval_id = ?').run(JSON.stringify(request), id);
+    const json = JSON.stringify(request);
+    if (!this.#sealer) {
+      this.db.prepare('UPDATE approvals SET request_json = ? WHERE approval_id = ?').run(json, id);
+      return;
+    }
+    this.db
+      .prepare('UPDATE approvals SET request_json = \'\', request_sealed = ? WHERE approval_id = ?')
+      .run(this.#sealText(json, approvalRequestAad(id)), id);
   }
 
   decideApproval(id: string, status: 'approved' | 'rejected' | 'done' | 'expired'): void {
@@ -493,6 +514,11 @@ export class LocalStore {
     if (stateCols.size > 0 && !stateCols.has('doc_sealed')) {
       this.db.exec('ALTER TABLE topic_state ADD COLUMN doc_sealed BLOB');
     }
+    const approvalCols = columnSet(this.db, 'approvals');
+    if (approvalCols.size > 0 && !approvalCols.has('summary_sealed')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN summary_sealed BLOB');
+      this.db.exec('ALTER TABLE approvals ADD COLUMN request_sealed BLOB');
+    }
     if (this.#sealer) this.#migratePlaintext();
   }
 
@@ -521,6 +547,13 @@ export class LocalStore {
     const updateState = this.db.prepare(
       'UPDATE topic_state SET doc_json = \'\', doc_sealed = ? WHERE topic_id = ? AND version = ?',
     );
+    const approvalRows = this.db
+      .prepare('SELECT approval_id, summary, request_json, summary_sealed, request_sealed FROM approvals')
+      .all();
+    const updateApproval = this.db.prepare(
+      `UPDATE approvals SET summary = '', request_json = '', summary_sealed = ?, request_sealed = ?
+        WHERE approval_id = ?`,
+    );
     let migrated = 0;
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -548,6 +581,19 @@ export class LocalStore {
         updateState.run(this.#sealText(json, stateAad(topicId, version)), topicId, version);
         migrated += 1;
       }
+      for (const row of approvalRows) {
+        if (row.summary_sealed != null || row.request_sealed != null) continue;
+        const id = String(row.approval_id);
+        const summary = row.summary === null || row.summary === undefined ? '' : String(row.summary);
+        const requestJson = row.request_json === null || row.request_json === undefined ? '' : String(row.request_json);
+        if (summary === '' && requestJson === '') continue;
+        updateApproval.run(
+          this.#sealText(summary, approvalSummaryAad(id)),
+          this.#sealText(requestJson === '' ? '{}' : requestJson, approvalRequestAad(id)),
+          id,
+        );
+        migrated += 1;
+      }
       this.db.exec('COMMIT');
     } catch (err) {
       this.db.exec('ROLLBACK');
@@ -556,6 +602,41 @@ export class LocalStore {
     // Free pages and the WAL keep the pre-image until the file is rebuilt.
     // This connection is the only one open while that happens (see scrubPlaintext).
     if (migrated > 0) this.scrubDisk();
+  }
+
+  #sealApproval(
+    id: string,
+    summary: string,
+    requestJson: string,
+  ): { summary: string; requestJson: string; summarySealed: Uint8Array | null; requestSealed: Uint8Array | null } {
+    if (!this.#sealer) return { summary, requestJson, summarySealed: null, requestSealed: null };
+    return {
+      summary: '',
+      requestJson: '',
+      summarySealed: this.#sealText(summary, approvalSummaryAad(id)),
+      requestSealed: this.#sealText(requestJson, approvalRequestAad(id)),
+    };
+  }
+
+  #approvalFrom(row: Record<string, unknown>): ApprovalRow {
+    const id = String(row.approval_id);
+    return {
+      approvalId: id,
+      topicId: String(row.topic_id),
+      kind: String(row.kind),
+      status: String(row.status),
+      requestedBy: String(row.requested_by),
+      summary: this.#readApprovalText(row.summary_sealed, row.summary, approvalSummaryAad(id)),
+      request: JSON.parse(this.#readApprovalText(row.request_sealed, row.request_json, approvalRequestAad(id)) || '{}'),
+      createdAt: String(row.created_at),
+      decidedAt: row.decided_at === null ? null : String(row.decided_at),
+    };
+  }
+
+  #readApprovalText(sealed: unknown, legacy: unknown, aad: string): string {
+    if (sealed != null) return this.#openText(bytes(sealed), aad);
+    if (typeof legacy === 'string') return legacy;
+    return '';
   }
 
   #readDoc(row: Record<string, unknown>, topicId: string, version: number): unknown {
@@ -817,18 +898,12 @@ function markApplied(db: StoreDb, topicId: string, seq: number, applied: boolean
   db.prepare('UPDATE envelopes SET applied = ? WHERE topic_id = ? AND seq = ?').run(applied ? 1 : 0, topicId, seq);
 }
 
-function approvalRow(row: Record<string, unknown>): ApprovalRow {
-  return {
-    approvalId: String(row.approval_id),
-    topicId: String(row.topic_id),
-    kind: String(row.kind),
-    status: String(row.status),
-    requestedBy: String(row.requested_by),
-    summary: String(row.summary),
-    request: JSON.parse(String(row.request_json)),
-    createdAt: String(row.created_at),
-    decidedAt: row.decided_at === null ? null : String(row.decided_at),
-  };
+export function approvalSummaryAad(id: string): string {
+  return `approval:${id}:summary`;
+}
+
+export function approvalRequestAad(id: string): string {
+  return `approval:${id}:request`;
 }
 
 function parseScope(value: string): '*' | string[] {

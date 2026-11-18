@@ -45,6 +45,20 @@ const SNAPSHOT_EVERY = 50;
 const INVITE_CLAIM_SECONDS = 7 * 24 * 60 * 60;
 /** Section 5.7: a bridge commits a self-Update when it has not committed for this long. */
 export const SELF_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * Longest sleep passed to `setTimeout`. Node clamps a delay above 2^31-1 ms
+ * to 1 ms, which would busy-loop. Waking at least daily also notices a forward
+ * clock step: the callback reads the stored deadline again instead of waiting
+ * out the delay it was armed with.
+ */
+export const SELF_UPDATE_WAKE_CAP_MS = 24 * 60 * 60 * 1000;
+const SET_TIMEOUT_MAX_MS = 2_147_483_647;
+
+/** Delay for one arm. Never above 24h or the Node timeout ceiling. */
+export function selfUpdateTimerDelay(deadlineAt: number, now = Date.now()): number {
+  const remaining = Math.max(0, deadlineAt - now);
+  return Math.min(remaining, SELF_UPDATE_WAKE_CAP_MS, SET_TIMEOUT_MAX_MS);
+}
 
 export interface ContactView {
   handle: string;
@@ -184,6 +198,7 @@ export class Bridge {
   #closed = false;
   #selfUpdateTimer: ReturnType<typeof setTimeout> | undefined;
   #nextSelfUpdateAt: number | undefined;
+  #wakeDelayMs: number | undefined;
   #servers: Array<{ close: () => Promise<void> }> = [];
 
   constructor(home: string) {
@@ -683,7 +698,7 @@ export class Bridge {
     const updated: string[] = [];
     for (const [topicId, session] of this.#sessions) {
       if (session.status !== 'active') continue;
-      const last = this.local.lastCommitAt(topicId);
+      const last = this.#clampCommitClock(topicId, this.local.lastCommitAt(topicId), now);
       if (last !== undefined && now - last < SELF_UPDATE_INTERVAL_MS) continue;
       try {
         await this.selfUpdate(topicId);
@@ -706,6 +721,11 @@ export class Bridge {
   rescheduleSelfUpdates(): number | undefined {
     this.#armSelfUpdateTimer();
     return this.#nextSelfUpdateAt;
+  }
+
+  /** Sleep actually passed to the timer. Capped; not the full time until the deadline. */
+  selfUpdateWakeDelay(): number | undefined {
+    return this.#wakeDelayMs;
   }
 
   listContacts(): ContactView[] {
@@ -1200,13 +1220,13 @@ export class Bridge {
         continue;
       }
       const handle = (row.request as { handle?: string }).handle;
-      if (handle) {
-        try {
-          await this.#requireTrustedContact(handle);
-        } catch (err) {
-          if (err instanceof BridgeError && err.code === 'contact_key_changed') continue;
-          if (err instanceof BridgeError && err.code === 'relay_unavailable') continue;
-        }
+      // Any trust-check failure leaves the stored signature unclaimed. A
+      // changed key, a missing pin row, or a relay miss must not add anyone.
+      if (!handle) continue;
+      try {
+        await this.#requireTrustedContact(handle);
+      } catch {
+        continue;
       }
       const signature = new Uint8Array(Buffer.from(request.signature, 'base64'));
       try {
@@ -1332,6 +1352,13 @@ export class Bridge {
     this.#armSelfUpdateTimer();
   }
 
+  /** A commit timestamp ahead of the wall clock is skew. Treat it as now. */
+  #clampCommitClock(topicId: string, last: number | undefined, now: number): number | undefined {
+    if (last === undefined || last <= now) return last;
+    this.local.noteCommit(topicId, now);
+    return now;
+  }
+
   /**
    * One timer, aimed at the soonest stored deadline. Overdue topics are not
    * scheduled: startup's runDueSelfUpdates already commits those immediately.
@@ -1341,13 +1368,14 @@ export class Bridge {
     if (this.#selfUpdateTimer) clearTimeout(this.#selfUpdateTimer);
     this.#selfUpdateTimer = undefined;
     this.#nextSelfUpdateAt = undefined;
+    this.#wakeDelayMs = undefined;
     if (this.#closed) return;
     let soonest: number | undefined;
     let overdue = false;
     const now = Date.now();
     for (const [topicId, session] of this.#sessions) {
       if (session.status !== 'active') continue;
-      const last = this.local.lastCommitAt(topicId);
+      const last = this.#clampCommitClock(topicId, this.local.lastCommitAt(topicId), now);
       const dueAt = last === undefined ? now : last + SELF_UPDATE_INTERVAL_MS;
       if (dueAt <= now) {
         // A failed commit leaves the deadline in the past. Try again shortly
@@ -1363,11 +1391,13 @@ export class Bridge {
     }
     if (soonest === undefined) return;
     this.#nextSelfUpdateAt = soonest;
+    const delay = selfUpdateTimerDelay(soonest, Date.now());
+    this.#wakeDelayMs = delay;
     this.#selfUpdateTimer = setTimeout(() => {
       this.#selfUpdateTimer = undefined;
       if (this.#closed) return;
       void this.runDueSelfUpdates().catch(() => this.#armSelfUpdateTimer());
-    }, Math.max(0, soonest - Date.now()));
+    }, delay);
     this.#selfUpdateTimer.unref();
   }
 

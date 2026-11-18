@@ -78,6 +78,21 @@ describe('envelope plaintext at rest', () => {
     db.prepare(
       `INSERT INTO topic_state (topic_id, version, doc_hash, doc_json, updated_seq) VALUES ('topic-1', 0, ?, ?, 1)`,
     ).run(hashBytes(stateDoc), JSON.stringify(stateDoc));
+    db.exec(`CREATE TABLE approvals (
+      approval_id TEXT PRIMARY KEY,
+      topic_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      requested_by TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      request_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`);
+    db.prepare(
+      `INSERT INTO approvals (
+         approval_id, topic_id, kind, status, requested_by, summary, request_json, created_at
+       ) VALUES ('apr_old', 'topic-1', 'request', 'pending', 'ada/cli', ?, ?, '2026-11-01T00:00:00.000Z')`,
+    ).run('approval-summary-plaintext-9f3c2a', JSON.stringify({ body: 'approval-request-plaintext-9f3c2a' }));
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     db.close();
 
@@ -86,10 +101,16 @@ describe('envelope plaintext at rest', () => {
     expect(storeBytes(path).includes(Buffer.from(MARKER))).toBe(false);
     expect(storeBytes(path).includes(Buffer.from(PAYLOAD))).toBe(false);
     expect(storeBytes(path).includes(Buffer.from('shared-state-plaintext-9f3c2a'))).toBe(false);
+    expect(storeBytes(path).includes(Buffer.from('approval-summary-plaintext-9f3c2a'))).toBe(false);
+    expect(storeBytes(path).includes(Buffer.from('approval-request-plaintext-9f3c2a'))).toBe(false);
 
     const local = new LocalStore(path, { sealer });
     expect(local.envelopes('topic-1', 0, 10)[0]).toMatchObject({ body: MARKER, payload: { note: PAYLOAD } });
     expect(local.state('topic-1')?.doc).toEqual(stateDoc);
+    expect(local.approval('apr_old')).toMatchObject({
+      summary: 'approval-summary-plaintext-9f3c2a',
+      request: { body: 'approval-request-plaintext-9f3c2a' },
+    });
     const stored = local.db.prepare('SELECT body, payload_json, doc_json, doc_sealed FROM envelopes e JOIN topic_state s USING (topic_id)').get() as {
       body: string | null;
       payload_json: string;
@@ -103,6 +124,7 @@ describe('envelope plaintext at rest', () => {
     local.db.exec('PRAGMA secure_delete = ON');
     local.db.prepare('DELETE FROM envelopes').run();
     local.db.prepare('DELETE FROM topic_state').run();
+    local.db.prepare('DELETE FROM approvals').run();
     local.scrubDisk();
     local.close();
     for (const suffix of ['-wal', '-shm', '-journal']) {
@@ -116,6 +138,8 @@ describe('envelope plaintext at rest', () => {
     expect(afterDelete.includes(Buffer.from(MARKER))).toBe(false);
     expect(afterDelete.includes(Buffer.from(PAYLOAD))).toBe(false);
     expect(afterDelete.includes(Buffer.from('shared-state-plaintext-9f3c2a'))).toBe(false);
+    expect(afterDelete.includes(Buffer.from('approval-summary-plaintext-9f3c2a'))).toBe(false);
+    expect(afterDelete.includes(Buffer.from('approval-request-plaintext-9f3c2a'))).toBe(false);
   });
 
   it('keeps JSON Patch compare-and-swap working when the document is sealed', () => {
