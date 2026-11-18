@@ -1,10 +1,12 @@
 // Bridge rows that sit beside the MLS store in the same SQLite file.
-// Plaintext messages and shared state are written here. Secrets are not:
-// the MLS store seals those before they reach disk.
+// Envelope body and payload are sealed with the storage key before they reach
+// disk. The shared-state document is not. Secrets that the MLS store already
+// seals are not written here.
 
 import { DatabaseSync } from 'node:sqlite';
-import { bytesEqual } from '@agent-bridge/protocol';
-import type { Envelope, PersistedFrame, StoreDb } from '@agent-bridge/mls';
+import { bytesEqual, fromUtf8, utf8 } from '@agent-bridge/protocol';
+import type { Envelope, PersistedFrame, SecretSealer, StoreDb } from '@agent-bridge/mls';
+import { BridgeError } from './errors.ts';
 import { applyPatch, hashBytes, parseHashLabel } from './json.ts';
 import type { PatchOp } from './json.ts';
 import { verifyRequest, verifyState } from './signatures.ts';
@@ -46,6 +48,14 @@ export interface TokenRow {
   topics: '*' | string[];
   createdAt: string;
   revokedAt: string | null;
+}
+
+export interface ContactRecord {
+  handle: string;
+  identityKey: Uint8Array;
+  verifiedAt: string | null;
+  pendingKey: Uint8Array | null;
+  pendingAt: string | null;
 }
 
 const SCHEMA = `
@@ -100,11 +110,17 @@ CREATE TABLE IF NOT EXISTS envelopes (
   author_agent TEXT,
   type TEXT NOT NULL,
   body TEXT,
-  payload_json TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '',
   approval_ok INTEGER NOT NULL,
   applied INTEGER,
   ts TEXT NOT NULL,
+  body_sealed BLOB,
+  payload_sealed BLOB,
   PRIMARY KEY (topic_id, seq)
+);
+CREATE TABLE IF NOT EXISTS commit_clock (
+  topic_id TEXT PRIMARY KEY,
+  last_commit_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS member_seen (
   topic_id TEXT NOT NULL,
@@ -118,20 +134,14 @@ CREATE TABLE IF NOT EXISTS member_seen (
 
 export class LocalStore {
   readonly db: DatabaseSync;
+  readonly #sealer: SecretSealer | undefined;
 
-  constructor(path: string) {
+  constructor(path: string, options?: { sealer?: SecretSealer }) {
+    this.#sealer = options?.sealer;
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA busy_timeout = 1000');
     this.db.exec(SCHEMA);
-    const names = new Set(
-      this.db
-        .prepare('PRAGMA table_info(contacts)')
-        .all()
-        .map((row) => String(row.name)),
-    );
-    if (names.size > 0 && !names.has('verified_at')) {
-      this.db.exec('ALTER TABLE contacts ADD COLUMN verified_at TEXT');
-    }
+    this.#migrate();
   }
 
   close(): void {
@@ -234,11 +244,12 @@ export class LocalStore {
     const envelope = frame.envelope;
     if (!envelope) return undefined;
     const approvalOk = envelope.approval !== null && approvalVerifies(frame, envelope);
+    const sealed = this.#sealEnvelope(frame.topicId, frame.seq, envelope);
     db.prepare(
       `INSERT INTO envelopes (
          topic_id, seq, message_id, author_handle, author_agent, type, body, payload_json,
-         approval_ok, applied, ts
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+         approval_ok, applied, ts, body_sealed, payload_sealed
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
     ).run(
       frame.topicId,
       frame.seq,
@@ -246,10 +257,12 @@ export class LocalStore {
       envelope.author.handle,
       envelope.author.agent ?? null,
       envelope.type,
-      envelope.body ?? null,
-      JSON.stringify(envelope.payload),
+      sealed.body,
+      sealed.payloadJson,
       approvalOk ? 1 : 0,
       envelope.ts,
+      sealed.bodySealed,
+      sealed.payloadSealed,
     );
     if (envelope.type === 'state_snapshot') return applySnapshot(db, frame.topicId, frame.seq, envelope);
     if (envelope.type === 'state_patch') return applyStatePatch(db, frame.topicId, frame.seq, envelope);
@@ -272,11 +285,12 @@ export class LocalStore {
   envelopes(topicId: string, afterSeq: number, limit: number): EnvelopeRow[] {
     return this.db
       .prepare(
-        `SELECT seq, message_id, author_handle, author_agent, type, body, payload_json, approval_ok, applied, ts
+        `SELECT topic_id, seq, message_id, author_handle, author_agent, type, body, payload_json,
+                approval_ok, applied, ts, body_sealed, payload_sealed
            FROM envelopes WHERE topic_id = ? AND seq > ? ORDER BY seq LIMIT ?`,
       )
       .all(topicId, afterSeq, limit)
-      .map(envelopeRow);
+      .map((row) => this.#envelopeRow(row));
   }
 
   cursor(label: string, topicId: string): number {
@@ -393,8 +407,238 @@ export class LocalStore {
   }
 
   verified(handle: string): boolean {
-    const row = this.db.prepare('SELECT verified_at FROM contacts WHERE handle = ?').get(handle);
-    return row !== undefined && row.verified_at !== null;
+    const row = this.contact(handle);
+    return row !== undefined && row.verifiedAt !== null && row.pendingKey === null;
+  }
+
+  keyChanged(handle: string): boolean {
+    return this.contact(handle)?.pendingKey != null;
+  }
+
+  contact(handle: string): ContactRecord | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT handle, identity_pubkey, verified_at, pending_pubkey, pending_at
+           FROM contacts WHERE handle = ?`,
+      )
+      .get(handle);
+    return row ? contactRecord(row) : undefined;
+  }
+
+  contacts(): ContactRecord[] {
+    return this.db
+      .prepare(
+        `SELECT handle, identity_pubkey, verified_at, pending_pubkey, pending_at
+           FROM contacts ORDER BY handle`,
+      )
+      .all()
+      .map(contactRecord);
+  }
+
+  /** Remember a relay key that is not the pin. The pin itself is not updated. */
+  noteKeyChange(handle: string, pending: Uint8Array): void {
+    const current = this.contact(handle);
+    if (!current) return;
+    if (current.pendingKey && bytesEqual(current.pendingKey, pending)) return;
+    this.db
+      .prepare('UPDATE contacts SET pending_pubkey = ?, pending_at = ? WHERE handle = ?')
+      .run(pending, new Date().toISOString(), handle);
+  }
+
+  clearPending(handle: string): void {
+    this.db.prepare('UPDATE contacts SET pending_pubkey = NULL, pending_at = NULL WHERE handle = ?').run(handle);
+  }
+
+  markVerified(handle: string): void {
+    const result = this.db
+      .prepare('UPDATE contacts SET verified_at = ? WHERE handle = ?')
+      .run(new Date().toISOString(), handle);
+    if (result.changes !== 1) throw new BridgeError('not_found', 'no such contact', 404);
+  }
+
+  noteCommit(topicId: string, at: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO commit_clock (topic_id, last_commit_at) VALUES (?, ?)
+         ON CONFLICT (topic_id) DO UPDATE SET last_commit_at = excluded.last_commit_at`,
+      )
+      .run(topicId, at);
+  }
+
+  lastCommitAt(topicId: string): number | undefined {
+    const row = this.db.prepare('SELECT last_commit_at FROM commit_clock WHERE topic_id = ?').get(topicId);
+    if (!row) return undefined;
+    return Number(row.last_commit_at);
+  }
+
+  #migrate(): void {
+    const envelopes = columnSet(this.db, 'envelopes');
+    if (envelopes.size > 0 && !envelopes.has('body_sealed')) {
+      this.db.exec('ALTER TABLE envelopes ADD COLUMN body_sealed BLOB');
+      this.db.exec('ALTER TABLE envelopes ADD COLUMN payload_sealed BLOB');
+    }
+    const contacts = columnSet(this.db, 'contacts');
+    if (contacts.size > 0 && !contacts.has('verified_at')) {
+      this.db.exec('ALTER TABLE contacts ADD COLUMN verified_at TEXT');
+    }
+    if (contacts.size > 0 && !contacts.has('pending_pubkey')) {
+      this.db.exec('ALTER TABLE contacts ADD COLUMN pending_pubkey BLOB');
+      this.db.exec('ALTER TABLE contacts ADD COLUMN pending_at TEXT');
+    }
+    if (this.#sealer) this.#migrateEnvelopePlaintext();
+  }
+
+  /** Seal rows written before envelope plaintext was wrapped. Plaintext columns are cleared. */
+  #migrateEnvelopePlaintext(): void {
+    const rows = this.db
+      .prepare('SELECT topic_id, seq, body, payload_json, body_sealed, payload_sealed FROM envelopes')
+      .all();
+    const update = this.db.prepare(
+      `UPDATE envelopes SET body = NULL, payload_json = '', body_sealed = ?, payload_sealed = ?
+        WHERE topic_id = ? AND seq = ?`,
+    );
+    let migrated = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        if (row.body_sealed != null || row.payload_sealed != null) continue;
+        const topicId = String(row.topic_id);
+        const seq = Number(row.seq);
+        const body = row.body === null || row.body === undefined ? null : String(row.body);
+        const payload = row.payload_json === null || row.payload_json === undefined ? '{}' : String(row.payload_json);
+        if (body === null && payload === '') continue;
+        update.run(
+          body === null ? null : this.#sealText(body, bodyAad(topicId, seq)),
+          this.#sealText(payload === '' ? '{}' : payload, payloadAad(topicId, seq)),
+          topicId,
+          seq,
+        );
+        migrated += 1;
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    // SQLite keeps the old plaintext in free pages until the file is rewritten.
+    if (migrated > 0) {
+      try {
+        this.db.exec('VACUUM');
+      } catch {
+        // Another connection has the file open. The live rows are already sealed.
+      }
+    }
+  }
+
+  #sealEnvelope(
+    topicId: string,
+    seq: number,
+    envelope: Envelope,
+  ): { body: string | null; payloadJson: string; bodySealed: Uint8Array | null; payloadSealed: Uint8Array | null } {
+    const payload = JSON.stringify(envelope.payload);
+    if (!this.#sealer) {
+      return { body: envelope.body ?? null, payloadJson: payload, bodySealed: null, payloadSealed: null };
+    }
+    return {
+      body: null,
+      payloadJson: '',
+      bodySealed: envelope.body === undefined ? null : this.#sealText(envelope.body, bodyAad(topicId, seq)),
+      payloadSealed: this.#sealText(payload, payloadAad(topicId, seq)),
+    };
+  }
+
+  #sealText(plain: string, aad: string): Uint8Array {
+    if (!this.#sealer) throw new BridgeError('mls_error', 'storage key is missing', 500);
+    return this.#sealer.seal(utf8(plain), utf8(aad));
+  }
+
+  #openText(sealed: Uint8Array, aad: string): string {
+    if (!this.#sealer) throw new BridgeError('mls_error', 'stored message could not be opened', 500);
+    try {
+      return fromUtf8(this.#sealer.open(sealed, utf8(aad)));
+    } catch (err) {
+      if (err instanceof BridgeError) throw err;
+      throw new BridgeError('mls_error', 'stored message could not be opened', 500);
+    }
+  }
+
+  #envelopeRow(row: Record<string, unknown>): EnvelopeRow {
+    const topicId = String(row.topic_id);
+    const seq = Number(row.seq);
+    return {
+      seq,
+      messageId: String(row.message_id),
+      authorHandle: String(row.author_handle),
+      authorAgent: row.author_agent === null ? null : String(row.author_agent),
+      type: String(row.type),
+      body: this.#readBody(row, topicId, seq),
+      payload: this.#readPayload(row, topicId, seq),
+      approvalOk: Number(row.approval_ok) === 1,
+      applied: row.applied === null ? null : Number(row.applied) === 1,
+      ts: String(row.ts),
+    };
+  }
+
+  #readBody(row: Record<string, unknown>, topicId: string, seq: number): string | null {
+    if (row.body_sealed != null) return this.#openText(bytes(row.body_sealed), bodyAad(topicId, seq));
+    if (row.body === null || row.body === undefined) return null;
+    return String(row.body);
+  }
+
+  #readPayload(row: Record<string, unknown>, topicId: string, seq: number): unknown {
+    if (row.payload_sealed != null) {
+      return JSON.parse(this.#openText(bytes(row.payload_sealed), payloadAad(topicId, seq)));
+    }
+    if (typeof row.payload_json === 'string' && row.payload_json.length > 0) return JSON.parse(row.payload_json);
+    return {};
+  }
+}
+
+function bodyAad(topicId: string, seq: number): string {
+  return `envelope-body:${topicId}:${seq}`;
+}
+
+function payloadAad(topicId: string, seq: number): string {
+  return `envelope-payload:${topicId}:${seq}`;
+}
+
+function columnSet(db: DatabaseSync, table: string): Set<string> {
+  return new Set(
+    db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .map((row) => String(row.name)),
+  );
+}
+
+function contactRecord(row: Record<string, unknown>): ContactRecord {
+  return {
+    handle: String(row.handle),
+    identityKey: bytes(row.identity_pubkey),
+    verifiedAt: row.verified_at === null || row.verified_at === undefined ? null : String(row.verified_at),
+    pendingKey: row.pending_pubkey === null || row.pending_pubkey === undefined ? null : bytes(row.pending_pubkey),
+    pendingAt: row.pending_at === null || row.pending_at === undefined ? null : String(row.pending_at),
+  };
+}
+
+/** Read contacts without opening the bridge. The daemon's writes are already committed. */
+export function readContacts(path: string): ContactRecord[] {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 1000');
+    const names = columnSet(db, 'contacts');
+    if (!names.has('handle')) return [];
+    const verified = names.has('verified_at') ? 'verified_at' : 'NULL AS verified_at';
+    const pendingKey = names.has('pending_pubkey') ? 'pending_pubkey' : 'NULL AS pending_pubkey';
+    const pendingAt = names.has('pending_at') ? 'pending_at' : 'NULL AS pending_at';
+    return db
+      .prepare(
+        `SELECT handle, identity_pubkey, ${verified}, ${pendingKey}, ${pendingAt} FROM contacts ORDER BY handle`,
+      )
+      .all()
+      .map(contactRecord);
+  } finally {
+    db.close();
   }
 }
 
@@ -474,21 +718,6 @@ function writeState(db: StoreDb, topicId: string, version: number, hash: Uint8Ar
 
 function markApplied(db: StoreDb, topicId: string, seq: number, applied: boolean): void {
   db.prepare('UPDATE envelopes SET applied = ? WHERE topic_id = ? AND seq = ?').run(applied ? 1 : 0, topicId, seq);
-}
-
-function envelopeRow(row: Record<string, unknown>): EnvelopeRow {
-  return {
-    seq: Number(row.seq),
-    messageId: String(row.message_id),
-    authorHandle: String(row.author_handle),
-    authorAgent: row.author_agent === null ? null : String(row.author_agent),
-    type: String(row.type),
-    body: row.body === null ? null : String(row.body),
-    payload: JSON.parse(String(row.payload_json)),
-    approvalOk: Number(row.approval_ok) === 1,
-    applied: row.applied === null ? null : Number(row.applied) === 1,
-    ts: String(row.ts),
-  };
 }
 
 function approvalRow(row: Record<string, unknown>): ApprovalRow {

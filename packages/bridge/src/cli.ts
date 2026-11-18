@@ -4,11 +4,14 @@
 // refuse to run without a TTY, and they never take the passphrase as a flag.
 
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
 import { stdin, stdout } from 'node:process';
 import { BridgeError } from './errors.ts';
 import { bridgePaths, initBridge } from './bridge.ts';
-import { fingerprint } from './fingerprint.ts';
+import { fingerprint, fingerprintQrPayload, parseFingerprint } from './fingerprint.ts';
+import { readContacts } from './local.ts';
+import type { ContactRecord } from './local.ts';
+import { qrTerminal } from './qr.ts';
 
 const args = process.argv.slice(2);
 const flags = takeFlags(args);
@@ -27,6 +30,9 @@ try {
   stdout.write(`${JSON.stringify(error.body())}\n`);
   process.exitCode = 1;
 }
+// A TTY stays open after the passphrase prompt. Don't wait for the terminal to close.
+stdin.pause();
+stdin.unref();
 
 async function run(): Promise<unknown> {
   if (command === 'init') {
@@ -38,7 +44,9 @@ async function run(): Promise<unknown> {
     return initBridge({ home, handle, relayOrigin: relay, passphrase });
   }
   if (command === 'fingerprint') {
-    return localFingerprint(home);
+    const shown = sub ? contactFingerprint(home, sub) : localFingerprint(home);
+    if (json) return { handle: shown.handle, fingerprint: shown.fingerprint, qr_payload: fingerprintQrPayload(shown.publicKey) };
+    return textFingerprint(shown);
   }
   if (command === 'serve') {
     const { openBridge } = await import('./bridge.ts');
@@ -66,14 +74,55 @@ async function run(): Promise<unknown> {
   }
   if (command === 'approvals' && sub === 'approve') {
     const passphrase = await promptPassphrase('Identity passphrase: ');
-    return humanPost(`/approvals/${rest[0]}/approve`, { passphrase });
+    return humanPost(`/approvals/${need(rest[0], 'approval id')}/approve`, { passphrase });
   }
-  if (command === 'approvals' && sub === 'reject') {
+  if (command === 'approvals' && (sub === 'reject' || sub === 'deny')) {
     const passphrase = await promptPassphrase('Identity passphrase: ');
-    return humanPost(`/approvals/${rest[0]}/reject`, { passphrase });
+    return humanPost(`/approvals/${need(rest[0], 'approval id')}/reject`, { passphrase });
+  }
+  if (command === 'approvals' && sub === 'show') {
+    const detail = await authed('GET', `/v1/approvals/${encodeURIComponent(need(rest[0], 'approval id'))}`);
+    if (json) return detail;
+    return textApproval(detail);
   }
   if (command === 'approvals' && sub === 'list') {
-    return authed('GET', `/v1/approvals${flags.topic ? `?topic_id=${flags.topic}` : ''}`);
+    const query = new URLSearchParams();
+    if (flags.topic) query.set('topic_id', flags.topic);
+    if (flags.status) query.set('status', flags.status);
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const listed = await authed('GET', `/v1/approvals${suffix}`);
+    if (json) return listed;
+    return textApprovalList(listed);
+  }
+  if (command === 'contact' && sub === 'list') {
+    const contacts = readContacts(bridgePaths(home).sqlite)
+      .filter((contact) => contact.handle !== localFingerprint(home).handle)
+      .map(contactText);
+    if (json) return { contacts };
+    if (contacts.length === 0) return 'No contacts pinned yet.';
+    return contacts.map((contact) => `${contact.handle}  ${contact.state}  ${contact.fingerprint}`).join('\n');
+  }
+  if (command === 'contact' && sub === 'show') {
+    const contact = contactText(needContact(home, need(rest[0], 'handle')));
+    if (json) return contact;
+    const lines = [
+      `${contact.handle}  ${contact.state}`,
+      contact.fingerprint,
+      qrTerminal(contact.qr_payload),
+    ];
+    if (contact.pending_fingerprint && contact.pending_qr_payload) {
+      lines.push('KEY CHANGED. This contact is blocked until you verify the new fingerprint.', contact.pending_fingerprint, qrTerminal(contact.pending_qr_payload));
+    }
+    return lines.join('\n');
+  }
+  if (command === 'contact' && sub === 'verify') {
+    const handle = need(rest[0], 'handle');
+    const presented = rest.slice(1).join(' ');
+    if (!parseFingerprint(presented)) {
+      throw new BridgeError('invalid_request', 'fingerprint must be 60 digits or an agbfp:v1 QR payload');
+    }
+    const passphrase = await promptPassphrase('Identity passphrase: ');
+    return humanPost(`/contacts/${encodeURIComponent(handle)}/verify`, { passphrase, fingerprint: presented });
   }
   if (command === 'topic' && sub === 'list') return authed('GET', '/v1/topics');
   if (command === 'topic' && sub === 'create') {
@@ -159,31 +208,112 @@ async function proxyMcp(tokenFile: string): Promise<void> {
   }
 }
 
-function localFingerprint(dir: string): { handle: string; fingerprint: string } {
+function localFingerprint(dir: string): { handle: string; fingerprint: string; publicKey: Uint8Array } {
   const db = new DatabaseSync(bridgePaths(dir).sqlite, { readOnly: true });
   try {
     const row = db.prepare('SELECT handle, identity_pubkey FROM identity').get() as
       | { handle: string; identity_pubkey: Uint8Array }
       | undefined;
     if (!row) throw new BridgeError('not_found', 'no identity in this home', 404);
-    return { handle: row.handle, fingerprint: fingerprint(row.identity_pubkey) };
+    const publicKey = new Uint8Array(row.identity_pubkey);
+    return { handle: row.handle, fingerprint: fingerprint(publicKey), publicKey };
   } finally {
     db.close();
   }
+}
+
+function contactFingerprint(dir: string, handle: string): { handle: string; fingerprint: string; publicKey: Uint8Array } {
+  const contact = needContact(dir, handle);
+  return { handle: contact.handle, fingerprint: fingerprint(contact.identityKey), publicKey: contact.identityKey };
+}
+
+function needContact(dir: string, handle: string): ContactRecord {
+  const contact = readContacts(bridgePaths(dir).sqlite).find((row) => row.handle === handle);
+  if (!contact) throw new BridgeError('not_found', 'no such contact', 404);
+  return contact;
+}
+
+function contactText(contact: ContactRecord): {
+  handle: string;
+  state: string;
+  fingerprint: string;
+  qr_payload: string;
+  pending_fingerprint: string | null;
+  pending_qr_payload: string | null;
+  verified: boolean;
+  key_changed: boolean;
+} {
+  const keyChanged = contact.pendingKey !== null;
+  const verified = !keyChanged && contact.verifiedAt !== null;
+  return {
+    handle: contact.handle,
+    state: keyChanged ? 'key changed' : verified ? 'verified' : 'unverified',
+    fingerprint: fingerprint(contact.identityKey),
+    qr_payload: fingerprintQrPayload(contact.identityKey),
+    pending_fingerprint: contact.pendingKey ? fingerprint(contact.pendingKey) : null,
+    pending_qr_payload: contact.pendingKey ? fingerprintQrPayload(contact.pendingKey) : null,
+    verified,
+    key_changed: keyChanged,
+  };
+}
+
+function textFingerprint(shown: { handle: string; fingerprint: string; publicKey: Uint8Array }): string {
+  return `${shown.handle}\n${shown.fingerprint}\n${qrTerminal(fingerprintQrPayload(shown.publicKey))}`;
+}
+
+function textApprovalList(body: unknown): string {
+  const items = isRecord(body) && Array.isArray(body.items) ? body.items : [];
+  if (items.length === 0) return 'No approvals.';
+  return items
+    .map((item) => {
+      if (!isRecord(item)) return '';
+      const hold = typeof item.hold === 'string' ? item.hold : item.kind;
+      return `${item.approval_id}  ${item.status}  ${hold}  ${item.requested_by}\n  ${item.summary}`;
+    })
+    .filter((line) => line.length > 0)
+    .join('\n');
+}
+
+function textApproval(body: unknown): string {
+  if (!isRecord(body)) return JSON.stringify(body);
+  const lines = [
+    `${body.approval_id}  ${body.status}  ${body.hold ?? body.kind}`,
+    String(body.summary ?? ''),
+    `requested by ${body.requested_by}`,
+  ];
+  if (typeof body.topic_title === 'string' && body.topic_title) lines.push(`topic ${body.topic_title}`);
+  if (Array.isArray(body.sensitive_paths) && body.sensitive_paths.length > 0) {
+    lines.push(`sensitive paths ${body.sensitive_paths.join(', ')}`);
+  }
+  lines.push(JSON.stringify(body.request ?? {}, null, 2));
+  const contact = isRecord(body.contact) ? body.contact : undefined;
+  if (contact && typeof contact.fingerprint === 'string' && typeof contact.qr_payload === 'string') {
+    const state = contact.key_changed ? 'KEY CHANGED' : contact.verified ? 'verified' : 'unverified';
+    lines.push(`${contact.handle}  ${state}`, contact.fingerprint, qrTerminal(contact.qr_payload));
+    if (typeof contact.pending_fingerprint === 'string' && typeof contact.pending_qr_payload === 'string') {
+      lines.push('New fingerprint. Verify it before approving.', contact.pending_fingerprint, qrTerminal(contact.pending_qr_payload));
+    }
+  }
+  return lines.join('\n');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function promptPassphrase(label: string): Promise<string> {
   if (!stdin.isTTY) {
     throw new BridgeError('invalid_passphrase', 'a TTY is required to enter the identity passphrase', 401);
   }
-  stdout.write(label);
   stdin.setRawMode(true);
-  return new Promise((resolve) => {
-    let value = '';
+  let value = '';
+  const result = new Promise<string>((resolve) => {
     const onData = (chunk: Buffer) => {
       const text = chunk.toString('utf8');
       if (text === '\u0003') process.exit(1);
-      if (text === '\r' || text === '\n') {
+      if (text.includes('\r') || text.includes('\n')) {
+        const end = text.search(/\r|\n/);
+        value += text.slice(0, end);
         stdin.setRawMode(false);
         stdin.off('data', onData);
         stdout.write('\n');
@@ -198,6 +328,10 @@ function promptPassphrase(label: string): Promise<string> {
     };
     stdin.on('data', onData);
   });
+  // Write the prompt after the listener is attached. A fast terminal can
+  // answer before a later `on('data')` would run.
+  writeSync(1, label);
+  return result;
 }
 
 function takeFlags(argv: string[]): Record<string, string> {

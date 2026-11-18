@@ -573,9 +573,9 @@ Added during implementation (milestone 2): `auth_challenges` (single-use login n
 
 ### 4.2 Bridge local store (SQLite, per person)
 
-Path: `~/.agent-bridge/store.sqlite`. Keys and MLS state are wrapped at the application level (AES-256-GCM). Message and state plaintext rely on OS disk encryption in MVP; SQLCipher is a later option.
+Path: `~/.agent-bridge/store.sqlite`. Keys and MLS state are wrapped at the application level (AES-256-GCM). Envelope plaintext (`body` and `payload` in the `envelopes` table) is sealed with the same `storage.key`. Shared-state documents still rely on OS disk encryption in MVP; SQLCipher is a later option.
 
-**At-rest wrapping.** `storage.key` (mode 0600) is 32 random bytes. It seals the device private key, every saved MLS state (confirmed and staged), and KeyPackage private material with AES-256-GCM. Associated data binds each ciphertext to its row. The identity private key is not under that key: a passphrase is stretched with Argon2id (time 2, memory 19 MiB, parallelism 1) and the seed is sealed with a fresh salt and nonce, then zeroed after the one approval that opened it. Copying `store.sqlite` without `storage.key` does not yield those secrets.
+**At-rest wrapping.** `storage.key` (mode 0600) is 32 random bytes. It seals the device private key, every saved MLS state (confirmed and staged), KeyPackage private material, and envelope plaintext with AES-256-GCM. Associated data binds each ciphertext to its row (`envelope-body:<topic_id>:<seq>` and `envelope-payload:<topic_id>:<seq>` for messages), so a blob copied onto another row does not open. Rows written before this seal are encrypted on the next open. The identity private key is not under that key: a passphrase is stretched with Argon2id (time 2, memory 19 MiB, parallelism 1) and the seed is sealed with a fresh salt and nonce, then zeroed after the one approval that opened it. Copying `store.sqlite` without `storage.key` does not yield those secrets.
 
 ```sql
 CREATE TABLE identity (
@@ -819,7 +819,7 @@ sequenceDiagram
 - **Remove:** an agent calls `remove_member` → `removal_proposal` (or a local approval if its person is the topic owner) → the topic owner approves (passphrase) → `remove` approval → the topic owner's bridge commits Remove with the approval in `authenticated_data`. The relay stops fanout to the removed device; the new epoch is the cryptographic enforcement.
 - **Leave:** the person runs `agb topic leave` (human-only). The bridge posts `leave`; the topic owner's bridge commits the Remove automatically, citing the leave message's seq. No identity signature is needed; members check that the leave came from that member.
 - **Topic owner** cannot leave in MVP; `agb topic close` closes the topic (relay rejects new messages; data purged by retention).
-- **Key rotation:** each bridge commits a self-Update if it has not committed in 7 days, and after any suspected compromise.
+- **Key rotation:** each bridge commits a self-Update if it has not committed in 7 days, and after any suspected compromise. The daemon stores the time of its last commit per topic and checks it on startup and about once an hour, so a restart does not postpone the deadline. A missing clock (an upgrade) is treated as due. The unpublished-generation cap (32) still forces a self-Update earlier (section 5.8).
 - **Stale member re-add:** when the relay reports a member as stale, the topic owner gets a `remove` + `invite` approval pair to re-add that person, who then receives a fresh snapshot. The relay accepts that membership commit from the topic owner's device even when that device is itself stale.
 
 A topic's status on a bridge (`topics.status` in section 4.2):
@@ -990,7 +990,7 @@ The relay does not use `MlsEngine`. It reads the framing header with `decodeMlsM
 
 All three agent interfaces (MCP, REST, CLI) call the same handlers with the same per-agent token. The token sets `author.agent` and limits which topics the agent can see.
 
-**Approvals are not on the agent surface.** Agents create approval requests and can read their status. Only the person approves, through `agb approvals approve` (passphrase entered at a TTY prompt — never a flag, environment variable, or file) or the local approval UI on `127.0.0.1:8788` (passphrase per approval; agent tokens rejected).
+**Approvals are not on the agent surface.** Agents create approval requests and can read their status. Only the person approves, through `agb approvals approve` (passphrase entered at a TTY prompt — never a flag, environment variable, or file) or the local approval page on `127.0.0.1:8788` (passphrase per approval; agent tokens rejected). The page is HTML served by the bridge, with no third-party assets. Approve and deny forms require a CSRF token bound to a loopback cookie. `agb` posts JSON to the same port; that JSON is not a browser form. Listing agent tokens on this port still requires the passphrase.
 
 **Policy** is the person's config, `~/.agent-bridge/policy.json`. Agents can only make it stricter for a call (`requires_approval: true`), never looser.
 
@@ -1026,9 +1026,11 @@ sequenceDiagram
   BB-->>Ag2: The request, with approval signed
 ```
 
-Errors use one shape: `{ "error": "not_found | unauthorized | out_of_scope | invalid_patch | topic_halted | topic_pending_join | self_update_required | mls_error | relay_unavailable", "message": "…", "details": {} }`. `conflict` and `pending_approval` are normal results, not errors. A halted topic's `message` is the stable reason text, not a library sentence.
+Errors use one shape: `{ "error": "not_found | unauthorized | out_of_scope | invalid_patch | topic_halted | topic_pending_join | self_update_required | contact_key_changed | mls_error | relay_unavailable", "message": "…", "details": {} }`. `conflict` and `pending_approval` are normal results, not errors. A halted topic's `message` is the stable reason text, not a library sentence. `contact_key_changed` means a pinned handle's relay identity key no longer matches the pin; an add stays blocked until `agb contact verify` confirms the new fingerprint.
 
 ### 6.2 MCP tools
+
+The daemon serves this surface with `@modelcontextprotocol/sdk` (protocol 2025-11-25) on loopback Streamable HTTP, answering JSON. Tool names, token scope, and error text are the bridge's; the SDK owns the JSON-RPC session.
 
 Server instructions (the first ~512 characters stand alone):
 
@@ -1110,7 +1112,7 @@ The slug and title are stored inside the encrypted state (`/_meta`), never on th
 #### `list_members`
 
 Input: `{ "topic_id": "string" }`.  
-Output: `{ "members": [{ "handle": "string", "role": "owner|member", "fingerprint": "string", "verified": true, "joined_at": "date-time", "removed_at": "date-time|null" }] }`. `verified` is true only after an out-of-band fingerprint check.
+Output: `{ "members": [{ "handle": "string", "role": "owner|member", "fingerprint": "string", "verified": true, "key_changed": false, "joined_at": "date-time", "removed_at": "date-time|null" }] }`. `verified` is true only after an out-of-band fingerprint check. `key_changed` is true when the relay is publishing a different identity key than the pin; `verified` is then false.
 
 #### `invite_member`
 
@@ -1276,7 +1278,7 @@ Output: `{ "topic_id": "string", "version": 8, "hash": "sha256:…", "doc": {}, 
 #### `list_approvals`
 
 Input: `{ "topic_id": "string (optional)", "status": "pending|approved|rejected|all (default pending)" }`.  
-Output: `{ "items": [{ "approval_id": "string", "kind": "invite|remove|request|state_change", "topic_id": "string", "status": "string", "summary": "string", "requested_by": "string", "created_at": "date-time", "decided_at": "date-time|null" }] }`. Read-only; limited to topics in the agent's scope.
+Output: `{ "items": [{ "approval_id": "string", "kind": "invite|remove|request|state_change", "topic_id": "string", "status": "string", "summary": "string", "requested_by": "string", "created_at": "date-time", "decided_at": "date-time|null", "hold": "spend|external_message|sensitive_path|null" }] }`. `hold` says why a pending item is waiting. Read-only; limited to topics in the agent's scope.
 
 #### `sync`
 
@@ -1310,8 +1312,10 @@ agb init --handle <handle> --relay <url>          (human)  create keys, register
 agb serve                                                  run the bridge daemon
 agb mcp [--token-file <path>]                              stdio MCP proxy to the daemon (for Claude Desktop / Code / Cursor)
 
-agb fingerprint [handle]                                   show your (or a contact's) fingerprint
-agb contact verify <handle> <fingerprint>         (human)  mark a contact verified after an out-of-band check
+agb fingerprint [handle]                                   show your (or a contact's) safety number and its QR code
+agb contact list
+agb contact show <handle>
+agb contact verify <handle> <fingerprint>         (human)  mark a contact verified after an out-of-band check; accepts 60 digits or the QR payload
 agb token create <agent_label> [--topics id,id | --all] (human)  issue an agent token
 agb token list | agb token revoke <agent_label>   (human for revoke)
 
@@ -1335,6 +1339,7 @@ agb approvals list [--topic topic_id] [--status pending|all]
 agb approvals show <approval_id>
 agb approvals approve <approval_id>               (human)
 agb approvals reject <approval_id>                (human)
+agb approvals deny <approval_id>                  (human)  same as reject
 ```
 
 Non-human commands authenticate to the daemon with a token labeled `cli`.
@@ -1425,8 +1430,8 @@ Access control is mandatory: only current, non-stale members can post or fetch a
 
 ### 8.3 Contacts and fingerprints
 
-- The first time a bridge sees a handle, it pins that handle's identity key (TOFU). A later change is a hard error, never a silent update.
-- Fingerprint: SHA-256 of the identity public key, shown as 12 groups of 5 digits. People compare it out of band and run `agb contact verify`.
+- The first time a bridge sees a handle, it pins that handle's identity key (TOFU). A later change is a hard error, never a silent update. The bridge records the new key, shows the contact as key-changed (and unverified) to agents and on the approval page, and refuses to approve an add for that handle until `agb contact verify` confirms the new fingerprint out of band. Verifying the previously pinned fingerprint does not accept the new key. If the handle is still a member of a topic, the pin is left unchanged: verifying the new fingerprint is refused until that member is removed, so the existing group is not broken. The bridge does not replace its own identity key this way.
+- Fingerprint: SHA-256 of the identity public key, shown as 12 groups of 5 digits (a 60-digit safety number). The same digits are the QR payload `agbfp:v1:` followed by the 60 digits with no spaces. The approval page shows that QR, and `agb fingerprint` / `agb contact show` print it in the terminal. `agb contact verify` accepts the grouped number, the 60 digits, or the QR payload.
 - Unverified contacts are flagged in `list_members` and in every invite approval prompt. This is the defense against a malicious relay substituting keys at first contact.
 
 ### 8.4 Relay authentication
@@ -1454,7 +1459,7 @@ Exact encoding (implemented in `packages/protocol/src/signatures.ts`): the signe
 ### 8.6 Bridge authentication (agents)
 
 - **MVP (loopback only):** daemon binds `127.0.0.1:8787` (MCP `/mcp` and REST `/v1`). Each agent has its own bearer token (`agb token create`), stored hashed. `Origin` and `Host` headers are validated (DNS rebinding). `agb mcp` reads its token from a file passed by the agent's MCP config.
-- **Approval UI:** `127.0.0.1:8788`, separate listener, rejects agent tokens, passphrase per approval.
+- **Approval UI:** `127.0.0.1:8788`, separate listener, HTML only (no third-party assets), CSRF on form posts, rejects agent tokens, passphrase per approval. Token lists on this port require the passphrase.
 - **Post-MVP hosted path:** the bridge is published through a named Cloudflare Tunnel at `https://bridge.<person-domain>/mcp`.
   - OAuth 2.1 with PKCE; `/.well-known/oauth-protected-resource/mcp` (RFC 9728); CIMD and DCR; refresh-token rotation; audience-bound tokens (RFC 8707).
   - Redirect allow-list: `https://claude.ai/api/mcp/auth_callback` and loopback for Claude Code.
@@ -1579,6 +1584,16 @@ This is comparable to any unsealed-sender group messenger. Hiding membership and
 | # | Question | Needed by |
 | --- | --- | --- |
 | 6 | Relay hostname on Hostinger (Caddy domain) | Milestone 6 (deploy) |
+
+### 11.3 Resolved with milestone 5 (18 November 2026)
+
+| # | Question | Decision |
+| --- | --- | --- |
+| 11 | Fingerprint display | 60-digit safety number, 12 groups of 5, plus QR payload `agbfp:v1:<digits>`. `agb contact verify` accepts either. |
+| 12 | MCP implementation | `@modelcontextprotocol/sdk` on the loopback server. Tools, token scope, and error text stay as in section 6.2. |
+| 13 | Weekly self-Update | Persisted per-topic commit clock, checked on startup and about hourly, in addition to the 32-generation cap. |
+| 14 | Envelope plaintext | Sealed with `storage.key` (AES-256-GCM, row associated data), including rows already on disk. Shared state stays under OS disk encryption for now. |
+| 15 | Pinned key change | Loud, pin unchanged until `agb contact verify` of the new fingerprint. Adds for that handle are blocked until then. |
 
 ---
 

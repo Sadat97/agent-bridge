@@ -1,8 +1,15 @@
-// MCP 2025-11-25 over Streamable HTTP, speaking JSON (the daemon does not stream).
-// `agb mcp` is a stdio proxy onto this endpoint; the tool handlers are the
-// same methods the REST API calls.
+// MCP 2025-11-25 via the official TypeScript SDK. The daemon answers JSON
+// (it does not stream). `agb mcp` is a stdio proxy onto this endpoint; the
+// tool handlers are the same methods the REST API calls.
+//
+// The SDK's streamable transport requires Accept to list text/event-stream.
+// Clients that only send application/json still get one JSON body because
+// enableJsonResponse is set; the missing media type is added for the SDK.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { AgentCaller, Bridge } from './bridge.ts';
 import { BridgeError, toSurfaceError } from './errors.ts';
 import { isPatch } from './json.ts';
@@ -32,6 +39,9 @@ export async function handleMcp(bridge: Bridge, agent: AgentCaller, req: Incomin
     res.end(JSON.stringify({ error: 'invalid_request', message: 'Accept must include application/json', details: {} }));
     return;
   }
+  if (!accept.includes('text/event-stream')) {
+    req.headers.accept = accept ? `${accept}, text/event-stream` : 'application/json, text/event-stream';
+  }
   const body = await readBody(req);
   let message: JsonRpc;
   try {
@@ -40,50 +50,42 @@ export async function handleMcp(bridge: Bridge, agent: AgentCaller, req: Incomin
     writeRpc(res, undefined, { code: -32700, message: 'parse error' });
     return;
   }
-  if (typeof message.method === 'string' && message.method.startsWith('notifications/')) {
-    res.writeHead(202);
-    res.end();
-    return;
-  }
-  if (message.method !== 'initialize' && message.method !== 'ping' && message.method !== 'tools/list' && message.method !== 'tools/call') {
-    writeRpc(res, message.id, { code: -32601, message: 'method not found' });
-    return;
-  }
-  try {
-    const result = await callTool(bridge, agent, message);
-    writeRpc(res, message.id, undefined, result);
-  } catch (err) {
-    const surface = toSurfaceError(err);
-    if (message.method === 'tools/call') {
-      writeRpc(res, message.id, undefined, {
-        content: [{ type: 'text', text: JSON.stringify(surface.body()) }],
-        isError: true,
-      });
-      return;
+  if (message.method === 'initialize') message.params = normalizeInitialize(message.params);
+  const server = new Server(
+    { name: 'agent-bridge', version: '0.1.0' },
+    { capabilities: { tools: { listChanged: false } }, instructions: INSTRUCTIONS },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOLS }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const args = isRecord(request.params.arguments) ? request.params.arguments : {};
+    try {
+      const value = await dispatch(bridge, agent, request.params.name, args);
+      return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value };
+    } catch (err) {
+      const surface = toSurfaceError(err);
+      return { content: [{ type: 'text', text: JSON.stringify(surface.body()) }], isError: true };
     }
-    writeRpc(res, message.id, { code: -32602, message: surface.message });
+  });
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+  await server.connect(transport);
+  try {
+    await transport.handleRequest(req, res, message);
+  } finally {
+    await transport.close();
+    await server.close();
   }
 }
 
-async function callTool(bridge: Bridge, agent: AgentCaller, message: JsonRpc): Promise<unknown> {
-  if (message.method === 'initialize') {
-    return {
-      protocolVersion: '2025-11-25',
-      capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'agent-bridge', version: '0.1.0' },
-      instructions: INSTRUCTIONS,
-    };
-  }
-  if (message.method === 'ping') return {};
-  if (message.method === 'tools/list') return { tools: TOOLS };
-  if (message.method !== 'tools/call') {
-    throw new BridgeError('not_found', 'method not found', 404);
-  }
-  const params = isRecord(message.params) ? message.params : {};
-  const name = typeof params.name === 'string' ? params.name : '';
-  const args = isRecord(params.arguments) ? params.arguments : {};
-  const value = await dispatch(bridge, agent, name, args);
-  return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, isError: false };
+function normalizeInitialize(params: unknown): Record<string, unknown> {
+  const record = isRecord(params) ? params : {};
+  const clientInfo = isRecord(record.clientInfo) ? record.clientInfo : { name: 'agb', version: '0.1.0' };
+  const capabilities = isRecord(record.capabilities) ? record.capabilities : {};
+  return {
+    ...record,
+    protocolVersion: typeof record.protocolVersion === 'string' ? record.protocolVersion : '2025-11-25',
+    capabilities,
+    clientInfo,
+  };
 }
 
 export async function dispatch(bridge: Bridge, agent: AgentCaller, name: string, args: Record<string, unknown>): Promise<unknown> {

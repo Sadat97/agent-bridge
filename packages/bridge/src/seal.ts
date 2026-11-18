@@ -7,8 +7,10 @@
 //
 // The identity private key is not under that key. A passphrase is stretched
 // with Argon2id and the seed is sealed with a fresh salt and nonce. The daemon
-// opens it for one approval and then zeroes the seed. Message plaintext and
-// the shared-state document stay unencrypted; those rely on OS disk encryption.
+// opens it for one approval and then zeroes the seed. Envelope plaintext
+// (body and payload) is sealed with this same key; associated data binds it
+// to the topic id and seq. The shared-state document still relies on OS disk
+// encryption.
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { argon2id } from '@noble/hashes/argon2.js';

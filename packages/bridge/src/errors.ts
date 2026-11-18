@@ -16,6 +16,7 @@ const SURFACE_STATUS: Record<string, number> = {
   topic_closed: 409,
   topic_stale: 409,
   self_update_required: 409,
+  contact_key_changed: 409,
   generation_gap: 409,
   generation_past: 409,
   relay_unavailable: 503,

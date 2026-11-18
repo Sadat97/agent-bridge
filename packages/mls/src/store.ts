@@ -455,6 +455,32 @@ export class MlsStore {
     }
   }
 
+  /** First sight of a handle, or the same key again. A different key throws and is not stored. */
+  pinIdentity(pin: IdentityPin): void {
+    let added = false;
+    this.transaction(() => {
+      added = this.#insertPin(pin);
+    });
+    if (added) this.pins.set(pin.handle, pin.identityKey.slice());
+  }
+
+  /**
+   * Replace a pin after the person verified the new fingerprint out of band.
+   * This is the only write that changes a pinned key. MLS processing must
+   * keep using `#insertPin`, which refuses a silent change.
+   */
+  rePin(handle: string, identityKey: Uint8Array): void {
+    this.transaction(() => {
+      const existing = this.#db.prepare('SELECT handle FROM contacts WHERE handle = ?').get(handle);
+      if (!existing) {
+        this.#db.prepare('INSERT INTO contacts (handle, identity_pubkey) VALUES (?, ?)').run(handle, identityKey);
+      } else {
+        this.#db.prepare('UPDATE contacts SET identity_pubkey = ? WHERE handle = ?').run(identityKey, handle);
+      }
+    });
+    this.pins.set(handle, identityKey.slice());
+  }
+
   /** Insert a pin or accept the same key. Throws, without writing, when the key differs. */
   #insertPin(pin: IdentityPin): boolean {
     const existing = this.#db.prepare('SELECT identity_pubkey FROM contacts WHERE handle = ?').get(pin.handle);
