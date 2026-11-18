@@ -30,7 +30,7 @@ import { BridgeError, toSurfaceError } from './errors.ts';
 import { fingerprint, fingerprintDigits, fingerprintQrPayload, parseFingerprint } from './fingerprint.ts';
 import { applyPatch, hashBytes, hashLabel, pointerValue } from './json.ts';
 import type { PatchOp } from './json.ts';
-import { LocalStore } from './local.ts';
+import { LocalStore, scrubPlaintext } from './local.ts';
 import type { ApprovalRow, EnvelopeRow } from './local.ts';
 import { DEFAULT_POLICY, loadPolicy, patchNeedsApproval, pathIsSensitive, requestNeedsApproval } from './policy.ts';
 import { RelayClient } from './relay.ts';
@@ -45,7 +45,6 @@ const SNAPSHOT_EVERY = 50;
 const INVITE_CLAIM_SECONDS = 7 * 24 * 60 * 60;
 /** Section 5.7: a bridge commits a self-Update when it has not committed for this long. */
 export const SELF_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
-const SELF_UPDATE_CHECK_MS = 60 * 60 * 1000;
 
 export interface ContactView {
   handle: string;
@@ -183,7 +182,8 @@ export class Bridge {
   readonly #held = new AsyncLocalStorage<Set<string>>();
   #socket: WebSocket | undefined;
   #closed = false;
-  #selfUpdateTimer: ReturnType<typeof setInterval> | undefined;
+  #selfUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+  #nextSelfUpdateAt: number | undefined;
   #servers: Array<{ close: () => Promise<void> }> = [];
 
   constructor(home: string) {
@@ -192,6 +192,9 @@ export class Bridge {
     this.config = JSON.parse(readFileSync(this.paths.config, 'utf8')) as BridgeConfig;
     const storageKey = new Uint8Array(readFileSync(this.paths.storageKey));
     const sealer = new AesGcmSealer(storageKey);
+    // Rebuild the file before the MLS connection opens, so VACUUM can run and
+    // WAL/journal sidecars that still hold plaintext can be removed.
+    scrubPlaintext(this.paths.sqlite, sealer);
     this.mls = new MlsStore(this.paths.sqlite, { sealer });
     this.local = new LocalStore(this.paths.sqlite, { sealer });
     chmodSync(this.paths.sqlite, 0o600);
@@ -226,7 +229,6 @@ export class Bridge {
     await this.#connectSocket();
     await this.syncAll();
     await this.runDueSelfUpdates();
-    this.#armSelfUpdateTimer();
     if (serve) {
       const { listen } = await import('./http.ts');
       const host = serve.host ?? '127.0.0.1';
@@ -240,7 +242,7 @@ export class Bridge {
 
   async close(): Promise<void> {
     this.#closed = true;
-    if (this.#selfUpdateTimer) clearInterval(this.#selfUpdateTimer);
+    if (this.#selfUpdateTimer) clearTimeout(this.#selfUpdateTimer);
     this.#socket?.terminate();
     await Promise.race([
       Promise.all(this.#servers.map((server) => server.close())),
@@ -384,7 +386,7 @@ export class Bridge {
       payload: { version: 0, hash: hashLabel(hashBytes(doc)), doc, reason: 'join' },
     });
     this.local.grantTopic(agent.label, topicId);
-    this.local.noteCommit(topicId, Date.now());
+    this.#rememberCommit(topicId, Date.now());
     this.#noteMembers(session);
     return { topic_id: topicId, slug: input.slug, state_version: this.local.state(topicId)?.version ?? 0 };
   }
@@ -601,7 +603,7 @@ export class Bridge {
     try {
       if (row.kind === 'join') {
         await this.#session(row.topicId).acceptJoin();
-        this.local.noteCommit(row.topicId, Date.now());
+        this.#rememberCommit(row.topicId, Date.now());
         this.local.decideApproval(approvalId, 'done');
         return { status: 'approved' };
       }
@@ -685,13 +687,25 @@ export class Bridge {
       if (last !== undefined && now - last < SELF_UPDATE_INTERVAL_MS) continue;
       try {
         await this.selfUpdate(topicId);
-        this.local.noteCommit(topicId, now);
+        this.#rememberCommit(topicId, now);
         updated.push(topicId);
       } catch {
-        // Leave the clock unchanged so the next check tries again.
+        // Leave the clock unchanged so the next deadline still fires.
       }
     }
+    this.#armSelfUpdateTimer();
     return updated;
+  }
+
+  /** Next time a self-update is due, or undefined when nothing is scheduled. */
+  nextSelfUpdateAt(): number | undefined {
+    return this.#nextSelfUpdateAt;
+  }
+
+  /** Read the commit clock and arm a timer for the soonest deadline. */
+  rescheduleSelfUpdates(): number | undefined {
+    this.#armSelfUpdateTimer();
+    return this.#nextSelfUpdateAt;
   }
 
   listContacts(): ContactView[] {
@@ -749,11 +763,10 @@ export class Bridge {
       // Replacing the pin now would make the next message from that member fail
       // credential checks. They have to be removed, then added with the new key.
       if (this.#memberOfTopic(handle)) {
-        throw new BridgeError(
-          'contact_key_changed',
-          `${handle} is still a member under the pinned key. Remove them before verifying the new fingerprint, then add them again.`,
-          409,
-        );
+        throw new BridgeError('contact_key_changed', keyChangeRecovery(handle, true), 409, {
+          handle,
+          recovery: 'remove_then_readd',
+        });
       }
       this.mls.rePin(handle, record.pendingKey);
       this.local.clearPending(handle);
@@ -989,7 +1002,7 @@ export class Bridge {
           const posted = await this.relay.post(session.topicId, staged);
           if (posted.ok) {
             await this.#finishPost(session, posted.seq);
-            this.local.noteCommit(session.topicId, Date.now());
+            this.#rememberCommit(session.topicId, Date.now());
             return posted.seq;
           }
           if (posted.code === 'stale_epoch') {
@@ -1314,13 +1327,47 @@ export class Bridge {
     return false;
   }
 
+  #rememberCommit(topicId: string, at: number): void {
+    this.local.noteCommit(topicId, at);
+    this.#armSelfUpdateTimer();
+  }
+
+  /**
+   * One timer, aimed at the soonest stored deadline. Overdue topics are not
+   * scheduled: startup's runDueSelfUpdates already commits those immediately.
+   * setTimeout accepts the 7-day delay (it is under 2^31-1 ms).
+   */
   #armSelfUpdateTimer(): void {
-    if (this.#selfUpdateTimer) return;
-    this.#selfUpdateTimer = setInterval(() => {
+    if (this.#selfUpdateTimer) clearTimeout(this.#selfUpdateTimer);
+    this.#selfUpdateTimer = undefined;
+    this.#nextSelfUpdateAt = undefined;
+    if (this.#closed) return;
+    let soonest: number | undefined;
+    let overdue = false;
+    const now = Date.now();
+    for (const [topicId, session] of this.#sessions) {
+      if (session.status !== 'active') continue;
+      const last = this.local.lastCommitAt(topicId);
+      const dueAt = last === undefined ? now : last + SELF_UPDATE_INTERVAL_MS;
+      if (dueAt <= now) {
+        // A failed commit leaves the deadline in the past. Try again shortly
+        // instead of waiting for the next process start.
+        overdue = true;
+        continue;
+      }
+      if (soonest === undefined || dueAt < soonest) soonest = dueAt;
+    }
+    if (overdue) {
+      const retryAt = now + 30_000;
+      if (soonest === undefined || retryAt < soonest) soonest = retryAt;
+    }
+    if (soonest === undefined) return;
+    this.#nextSelfUpdateAt = soonest;
+    this.#selfUpdateTimer = setTimeout(() => {
+      this.#selfUpdateTimer = undefined;
       if (this.#closed) return;
-      void this.#refreshContacts().catch(() => undefined);
-      void this.runDueSelfUpdates().catch(() => undefined);
-    }, SELF_UPDATE_CHECK_MS);
+      void this.runDueSelfUpdates().catch(() => this.#armSelfUpdateTimer());
+    }, Math.max(0, soonest - Date.now()));
     this.#selfUpdateTimer.unref();
   }
 
@@ -1349,16 +1396,13 @@ export class Bridge {
     const account = await this.relay.account(handle);
     const view = this.observeContact(handle, account.identityKey);
     if (view.key_changed) {
-      throw new BridgeError(
-        'contact_key_changed',
-        `${handle} has a new identity key. Compare it out of band and run agb contact verify before trusting it.`,
-        409,
-        {
-          handle,
-          pinned_fingerprint: view.fingerprint,
-          pending_fingerprint: view.pending_fingerprint,
-        },
-      );
+      const member = this.#memberOfTopic(handle);
+      throw new BridgeError('contact_key_changed', keyChangeRecovery(handle, member), 409, {
+        handle,
+        recovery: member ? 'remove_then_readd' : 'verify',
+        pinned_fingerprint: view.fingerprint,
+        pending_fingerprint: view.pending_fingerprint,
+      });
     }
     return view;
   }
@@ -1549,6 +1593,13 @@ function approvalView(row: ApprovalRow): Record<string, unknown> {
     decided_at: row.decidedAt,
     hold: holdKind(row),
   };
+}
+
+function keyChangeRecovery(handle: string, stillMember: boolean): string {
+  if (stillMember) {
+    return `${handle}'s identity key changed while they are still a member. Recovery is remove, then re-add: remove ${handle} from the topic, compare the new fingerprint out of band, run agb contact verify ${handle} <fingerprint>, then invite ${handle} again.`;
+  }
+  return `${handle}'s identity key changed. Compare the new fingerprint out of band and run agb contact verify ${handle} <fingerprint> before trusting it. An add stays blocked until then.`;
 }
 
 function holdKind(row: ApprovalRow): string | null {

@@ -241,7 +241,7 @@ describe('human surface', () => {
     await relay.pool.query('UPDATE accounts SET identity_pubkey = $1 WHERE handle = $2', [Buffer.from(bobNext.publicKey), 'bob']);
     await alice.syncAll();
     expect(() => alice.verifyContact('bob', fingerprintQrPayload(bobNext.publicKey), PASSPHRASE)).toThrow(
-      /still a member under the pinned key/,
+      /Recovery is remove, then re-add/,
     );
     expect(alice.mls.pins.get('bob')).toEqual(bobKey);
     await relay.pool.query('UPDATE accounts SET identity_pubkey = $1 WHERE handle = $2', [Buffer.from(bobKey), 'bob']);
@@ -329,7 +329,24 @@ describe('human surface', () => {
     expect((await alice.listTopics(cli, false)).topics.find((topic) => topic.topic_id === topicId)).toMatchObject({
       status: 'active',
     });
-  });
+
+    const last = Date.now() - SELF_UPDATE_INTERVAL_MS + 400;
+    alice.local.noteCommit(topicId, last);
+    const due = alice.rescheduleSelfUpdates();
+    expect(due).toBe(last + SELF_UPDATE_INTERVAL_MS);
+    const started = Date.now();
+    while (alice.local.lastCommitAt(topicId) === last) {
+      if (Date.now() - started > 10_000) throw new Error('self-update timer did not fire at the deadline');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const next = alice.nextSelfUpdateAt();
+    expect(next).toBeDefined();
+    expect(next! - Date.now()).toBeGreaterThan(SELF_UPDATE_INTERVAL_MS - 15_000);
+    await bob.syncAll();
+    expect((await bob.readMessages(cli, { topicId, sinceSeq: 0 })).messages).toContainEqual(
+      expect.objectContaining({ body: 'after the weekly update' }),
+    );
+  }, 40_000);
 });
 
 async function decide(port: number, id: string, decision: 'approve' | 'deny', passphrase: string): Promise<Response> {

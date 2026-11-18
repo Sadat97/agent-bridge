@@ -4,6 +4,7 @@
 // seals are not written here.
 
 import { DatabaseSync } from 'node:sqlite';
+import { existsSync, unlinkSync } from 'node:fs';
 import { bytesEqual, fromUtf8, utf8 } from '@agent-bridge/protocol';
 import type { Envelope, PersistedFrame, SecretSealer, StoreDb } from '@agent-bridge/mls';
 import { BridgeError } from './errors.ts';
@@ -99,7 +100,8 @@ CREATE TABLE IF NOT EXISTS topic_state (
   topic_id TEXT PRIMARY KEY,
   version INTEGER NOT NULL,
   doc_hash BLOB NOT NULL,
-  doc_json TEXT NOT NULL,
+  doc_json TEXT NOT NULL DEFAULT '',
+  doc_sealed BLOB,
   updated_seq INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS envelopes (
@@ -139,6 +141,7 @@ export class LocalStore {
   constructor(path: string, options?: { sealer?: SecretSealer }) {
     this.#sealer = options?.sealer;
     this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA secure_delete = ON');
     this.db.exec('PRAGMA busy_timeout = 1000');
     this.db.exec(SCHEMA);
     this.#migrate();
@@ -264,20 +267,21 @@ export class LocalStore {
       sealed.bodySealed,
       sealed.payloadSealed,
     );
-    if (envelope.type === 'state_snapshot') return applySnapshot(db, frame.topicId, frame.seq, envelope);
-    if (envelope.type === 'state_patch') return applyStatePatch(db, frame.topicId, frame.seq, envelope);
+    if (envelope.type === 'state_snapshot') return applySnapshot(db, frame.topicId, frame.seq, envelope, this.#sealer);
+    if (envelope.type === 'state_patch') return applyStatePatch(db, frame.topicId, frame.seq, envelope, this.#sealer);
     return undefined;
   }
 
   state(topicId: string): TopicStateRow | undefined {
     const row = this.db
-      .prepare('SELECT version, doc_hash, doc_json, updated_seq FROM topic_state WHERE topic_id = ?')
+      .prepare('SELECT version, doc_hash, doc_json, doc_sealed, updated_seq FROM topic_state WHERE topic_id = ?')
       .get(topicId);
     if (!row) return undefined;
+    const version = Number(row.version);
     return {
-      version: Number(row.version),
+      version,
       hash: bytes(row.doc_hash),
-      doc: JSON.parse(String(row.doc_json)),
+      doc: this.#readDoc(row, topicId, version),
       updatedSeq: Number(row.updated_seq),
     };
   }
@@ -485,17 +489,37 @@ export class LocalStore {
       this.db.exec('ALTER TABLE contacts ADD COLUMN pending_pubkey BLOB');
       this.db.exec('ALTER TABLE contacts ADD COLUMN pending_at TEXT');
     }
-    if (this.#sealer) this.#migrateEnvelopePlaintext();
+    const stateCols = columnSet(this.db, 'topic_state');
+    if (stateCols.size > 0 && !stateCols.has('doc_sealed')) {
+      this.db.exec('ALTER TABLE topic_state ADD COLUMN doc_sealed BLOB');
+    }
+    if (this.#sealer) this.#migratePlaintext();
   }
 
-  /** Seal rows written before envelope plaintext was wrapped. Plaintext columns are cleared. */
-  #migrateEnvelopePlaintext(): void {
+  /**
+   * Rewrite the file so freed pages cannot keep old plaintext, then drop WAL
+   * and rollback-journal sidecars. The caller must be the only connection.
+   */
+  scrubDisk(): void {
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    this.db.exec('VACUUM');
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  }
+
+  /** Seal rows written before plaintext was wrapped. Plaintext columns are cleared. */
+  #migratePlaintext(): void {
     const rows = this.db
       .prepare('SELECT topic_id, seq, body, payload_json, body_sealed, payload_sealed FROM envelopes')
       .all();
     const update = this.db.prepare(
       `UPDATE envelopes SET body = NULL, payload_json = '', body_sealed = ?, payload_sealed = ?
         WHERE topic_id = ? AND seq = ?`,
+    );
+    const stateRows = this.db
+      .prepare('SELECT topic_id, version, doc_json, doc_sealed FROM topic_state')
+      .all();
+    const updateState = this.db.prepare(
+      'UPDATE topic_state SET doc_json = \'\', doc_sealed = ? WHERE topic_id = ? AND version = ?',
     );
     let migrated = 0;
     this.db.exec('BEGIN IMMEDIATE');
@@ -515,19 +539,29 @@ export class LocalStore {
         );
         migrated += 1;
       }
+      for (const row of stateRows) {
+        if (row.doc_sealed != null) continue;
+        const json = row.doc_json === null || row.doc_json === undefined ? '' : String(row.doc_json);
+        if (json === '') continue;
+        const topicId = String(row.topic_id);
+        const version = Number(row.version);
+        updateState.run(this.#sealText(json, stateAad(topicId, version)), topicId, version);
+        migrated += 1;
+      }
       this.db.exec('COMMIT');
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
     }
-    // SQLite keeps the old plaintext in free pages until the file is rewritten.
-    if (migrated > 0) {
-      try {
-        this.db.exec('VACUUM');
-      } catch {
-        // Another connection has the file open. The live rows are already sealed.
-      }
-    }
+    // Free pages and the WAL keep the pre-image until the file is rebuilt.
+    // This connection is the only one open while that happens (see scrubPlaintext).
+    if (migrated > 0) this.scrubDisk();
+  }
+
+  #readDoc(row: Record<string, unknown>, topicId: string, version: number): unknown {
+    if (row.doc_sealed != null) return JSON.parse(this.#openText(bytes(row.doc_sealed), stateAad(topicId, version)));
+    if (typeof row.doc_json === 'string' && row.doc_json.length > 0) return JSON.parse(row.doc_json);
+    return {};
   }
 
   #sealEnvelope(
@@ -642,7 +676,13 @@ export function readContacts(path: string): ContactRecord[] {
   }
 }
 
-function applySnapshot(db: StoreDb, topicId: string, seq: number, envelope: Envelope): string | undefined {
+function applySnapshot(
+  db: StoreDb,
+  topicId: string,
+  seq: number,
+  envelope: Envelope,
+  sealer: SecretSealer | undefined,
+): string | undefined {
   const payload = envelope.payload;
   const doc = payload.doc;
   const version = payload.version;
@@ -650,15 +690,21 @@ function applySnapshot(db: StoreDb, topicId: string, seq: number, envelope: Enve
   if (typeof version !== 'number' || !Number.isInteger(version) || claimed === undefined) return 'state_diverged';
   const actual = hashBytes(doc);
   if (!bytesEqual(actual, claimed)) return 'state_diverged';
-  const current = readState(db, topicId);
+  const current = readState(db, topicId, sealer);
   if (current && current.version === version && bytesEqual(current.hash, actual)) return undefined;
   if (current && current.version === version && !bytesEqual(current.hash, actual)) return 'state_diverged';
   if (current && version < current.version) return undefined;
-  writeState(db, topicId, version, actual, doc, seq);
+  writeState(db, topicId, version, actual, doc, seq, sealer);
   return undefined;
 }
 
-function applyStatePatch(db: StoreDb, topicId: string, seq: number, envelope: Envelope): string | undefined {
+function applyStatePatch(
+  db: StoreDb,
+  topicId: string,
+  seq: number,
+  envelope: Envelope,
+  sealer: SecretSealer | undefined,
+): string | undefined {
   const payload = envelope.payload;
   const baseVersion = payload.base_version;
   const baseHash = typeof payload.base_hash === 'string' ? parseHashLabel(payload.base_hash) : undefined;
@@ -667,7 +713,7 @@ function applyStatePatch(db: StoreDb, topicId: string, seq: number, envelope: En
     markApplied(db, topicId, seq, false);
     return undefined;
   }
-  const current = readState(db, topicId);
+  const current = readState(db, topicId, sealer);
   if (!current || current.version !== baseVersion) {
     markApplied(db, topicId, seq, false);
     return undefined;
@@ -678,7 +724,7 @@ function applyStatePatch(db: StoreDb, topicId: string, seq: number, envelope: En
     markApplied(db, topicId, seq, false);
     return undefined;
   }
-  writeState(db, topicId, current.version + 1, hashBytes(applied.doc), applied.doc, seq);
+  writeState(db, topicId, current.version + 1, hashBytes(applied.doc), applied.doc, seq, sealer);
   markApplied(db, topicId, seq, true);
   return undefined;
 }
@@ -696,24 +742,75 @@ function approvalVerifies(frame: PersistedFrame, envelope: Envelope): boolean {
   return false;
 }
 
-function readState(db: StoreDb, topicId: string): TopicStateRow | undefined {
-  const row = db.prepare('SELECT version, doc_hash, doc_json, updated_seq FROM topic_state WHERE topic_id = ?').get(topicId);
+function readState(db: StoreDb, topicId: string, sealer: SecretSealer | undefined): TopicStateRow | undefined {
+  const row = db
+    .prepare('SELECT version, doc_hash, doc_json, doc_sealed, updated_seq FROM topic_state WHERE topic_id = ?')
+    .get(topicId);
   if (!row) return undefined;
+  const version = Number(row.version);
   return {
-    version: Number(row.version),
+    version,
     hash: bytes(row.doc_hash),
-    doc: JSON.parse(String(row.doc_json)),
+    doc: readDoc(row, topicId, version, sealer),
     updatedSeq: Number(row.updated_seq),
   };
 }
 
-function writeState(db: StoreDb, topicId: string, version: number, hash: Uint8Array, doc: unknown, seq: number): void {
+function writeState(
+  db: StoreDb,
+  topicId: string,
+  version: number,
+  hash: Uint8Array,
+  doc: unknown,
+  seq: number,
+  sealer: SecretSealer | undefined,
+): void {
+  const json = JSON.stringify(doc);
+  const sealed = sealer ? sealer.seal(utf8(json), utf8(stateAad(topicId, version))) : null;
   db.prepare(
-    `INSERT INTO topic_state (topic_id, version, doc_hash, doc_json, updated_seq) VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO topic_state (topic_id, version, doc_hash, doc_json, doc_sealed, updated_seq) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT (topic_id) DO UPDATE SET
        version = excluded.version, doc_hash = excluded.doc_hash,
-       doc_json = excluded.doc_json, updated_seq = excluded.updated_seq`,
-  ).run(topicId, version, hash, JSON.stringify(doc), seq);
+       doc_json = excluded.doc_json, doc_sealed = excluded.doc_sealed, updated_seq = excluded.updated_seq`,
+  ).run(topicId, version, hash, sealed ? '' : json, sealed, seq);
+}
+
+function readDoc(row: Record<string, unknown>, topicId: string, version: number, sealer: SecretSealer | undefined): unknown {
+  if (row.doc_sealed != null) {
+    if (!sealer) throw new BridgeError('mls_error', 'stored state could not be opened', 500);
+    try {
+      return JSON.parse(fromUtf8(sealer.open(bytes(row.doc_sealed), utf8(stateAad(topicId, version)))));
+    } catch (err) {
+      if (err instanceof BridgeError) throw err;
+      throw new BridgeError('mls_error', 'stored state could not be opened', 500);
+    }
+  }
+  if (typeof row.doc_json === 'string' && row.doc_json.length > 0) return JSON.parse(row.doc_json);
+  return {};
+}
+
+export function stateAad(topicId: string, version: number): string {
+  return `topic-state:${topicId}:${version}`;
+}
+
+/** Seal leftover plaintext and rebuild the file before any other connection opens. */
+export function scrubPlaintext(path: string, sealer: SecretSealer): void {
+  if (!existsSync(path)) return;
+  const local = new LocalStore(path, { sealer });
+  try {
+    // Migration vacuums when it rewrites rows. Vacuum again so a file that
+    // only needed secure_delete still drops free pages and the WAL.
+    local.scrubDisk();
+  } finally {
+    local.close();
+  }
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    try {
+      unlinkSync(path + suffix);
+    } catch {
+      // Already removed by the checkpoint.
+    }
+  }
 }
 
 function markApplied(db: StoreDb, topicId: string, seq: number, applied: boolean): void {

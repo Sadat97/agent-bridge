@@ -152,6 +152,7 @@ export class MlsStore {
   constructor(path: string, options?: { sealer?: SecretSealer }) {
     this.#sealer = options?.sealer;
     this.#db = new DatabaseSync(path);
+    this.#db.exec('PRAGMA secure_delete = ON');
     this.#db.prepare('PRAGMA journal_mode = WAL').get();
     this.#db.exec('PRAGMA synchronous = FULL');
     this.#db.exec('PRAGMA busy_timeout = 1000');
