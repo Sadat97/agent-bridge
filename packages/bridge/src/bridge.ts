@@ -27,12 +27,12 @@ import {
 import type { AddRequest, Credential, MlsEngine, RemoveRequest, TopicSession as Session } from '@agent-bridge/mls';
 import { MlsStore } from '@agent-bridge/mls';
 import { BridgeError, toSurfaceError } from './errors.ts';
-import { fingerprint } from './fingerprint.ts';
+import { fingerprint, fingerprintDigits, fingerprintQrPayload, parseFingerprint } from './fingerprint.ts';
 import { applyPatch, hashBytes, hashLabel, pointerValue } from './json.ts';
 import type { PatchOp } from './json.ts';
-import { LocalStore } from './local.ts';
+import { LocalStore, scrubPlaintext } from './local.ts';
 import type { ApprovalRow, EnvelopeRow } from './local.ts';
-import { DEFAULT_POLICY, loadPolicy, patchNeedsApproval, requestNeedsApproval } from './policy.ts';
+import { DEFAULT_POLICY, loadPolicy, patchNeedsApproval, pathIsSensitive, requestNeedsApproval } from './policy.ts';
 import { RelayClient } from './relay.ts';
 import { AesGcmSealer, unwrapPassphrase, wrapPassphrase } from './seal.ts';
 import { signRequest, signState } from './signatures.ts';
@@ -43,6 +43,33 @@ const KEY_TARGET = 20;
 const SNAPSHOT_EVERY = 50;
 /** Section 5.6: a signed add is retried until this claim lifetime, not the 72-hour decision window. */
 const INVITE_CLAIM_SECONDS = 7 * 24 * 60 * 60;
+/** Section 5.7: a bridge commits a self-Update when it has not committed for this long. */
+export const SELF_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * Longest sleep passed to `setTimeout`. Node clamps a delay above 2^31-1 ms
+ * to 1 ms, which would busy-loop. Waking at least daily also notices a forward
+ * clock step: the callback reads the stored deadline again instead of waiting
+ * out the delay it was armed with.
+ */
+export const SELF_UPDATE_WAKE_CAP_MS = 24 * 60 * 60 * 1000;
+const SET_TIMEOUT_MAX_MS = 2_147_483_647;
+
+/** Delay for one arm. Never above 24h or the Node timeout ceiling. */
+export function selfUpdateTimerDelay(deadlineAt: number, now = Date.now()): number {
+  const remaining = Math.max(0, deadlineAt - now);
+  return Math.min(remaining, SELF_UPDATE_WAKE_CAP_MS, SET_TIMEOUT_MAX_MS);
+}
+
+export interface ContactView {
+  handle: string;
+  fingerprint: string;
+  qr_payload: string;
+  verified: boolean;
+  key_changed: boolean;
+  pending_fingerprint: string | null;
+  pending_qr_payload: string | null;
+  verified_at: string | null;
+}
 
 export interface AgentCaller {
   label: string;
@@ -99,7 +126,7 @@ export async function initBridge(opts: {
   const sealer = new AesGcmSealer(storageKey);
   writeSecret(paths.storageKey, storageKey);
   const mls = new MlsStore(paths.sqlite, { sealer });
-  const local = new LocalStore(paths.sqlite);
+  const local = new LocalStore(paths.sqlite, { sealer });
   chmodSync(paths.sqlite, 0o600);
   try {
     local.saveIdentity(opts.handle, identity.publicKey, wrapPassphrase(identity.privateKey, opts.passphrase, utf8(`identity-key:${opts.handle}`)));
@@ -169,6 +196,9 @@ export class Bridge {
   readonly #held = new AsyncLocalStorage<Set<string>>();
   #socket: WebSocket | undefined;
   #closed = false;
+  #selfUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+  #nextSelfUpdateAt: number | undefined;
+  #wakeDelayMs: number | undefined;
   #servers: Array<{ close: () => Promise<void> }> = [];
 
   constructor(home: string) {
@@ -177,8 +207,11 @@ export class Bridge {
     this.config = JSON.parse(readFileSync(this.paths.config, 'utf8')) as BridgeConfig;
     const storageKey = new Uint8Array(readFileSync(this.paths.storageKey));
     const sealer = new AesGcmSealer(storageKey);
+    // Rebuild the file before the MLS connection opens, so VACUUM can run and
+    // WAL/journal sidecars that still hold plaintext can be removed.
+    scrubPlaintext(this.paths.sqlite, sealer);
     this.mls = new MlsStore(this.paths.sqlite, { sealer });
-    this.local = new LocalStore(this.paths.sqlite);
+    this.local = new LocalStore(this.paths.sqlite, { sealer });
     chmodSync(this.paths.sqlite, 0o600);
     const device = this.local.device();
     const identity = this.local.identity();
@@ -210,6 +243,7 @@ export class Bridge {
     await this.#topUp();
     await this.#connectSocket();
     await this.syncAll();
+    await this.runDueSelfUpdates();
     if (serve) {
       const { listen } = await import('./http.ts');
       const host = serve.host ?? '127.0.0.1';
@@ -223,6 +257,7 @@ export class Bridge {
 
   async close(): Promise<void> {
     this.#closed = true;
+    if (this.#selfUpdateTimer) clearTimeout(this.#selfUpdateTimer);
     this.#socket?.terminate();
     await Promise.race([
       Promise.all(this.#servers.map((server) => server.close())),
@@ -274,6 +309,7 @@ export class Bridge {
   async syncAll(): Promise<{ topics_synced: number; new_messages: number }> {
     await this.#topUp();
     await this.#retryInvites();
+    await this.#refreshContacts();
     const welcomes = await this.#takeWelcomes();
     let messages = welcomes;
     for (const topicId of [...this.#sessions.keys()]) {
@@ -365,6 +401,7 @@ export class Bridge {
       payload: { version: 0, hash: hashLabel(hashBytes(doc)), doc, reason: 'join' },
     });
     this.local.grantTopic(agent.label, topicId);
+    this.#rememberCommit(topicId, Date.now());
     this.#noteMembers(session);
     return { topic_id: topicId, slug: input.slug, state_version: this.local.state(topicId)?.version ?? 0 };
   }
@@ -374,17 +411,19 @@ export class Bridge {
     const session = this.#session(topicId);
     this.#noteMembers(session);
     return {
-      members: this.local.members(topicId).map((member) => ({
-        handle: member.handle,
-        role: member.role,
-        fingerprint: (() => {
-          const pinned = this.mls.pins.get(member.handle);
-          return pinned ? fingerprint(pinned) : '';
-        })(),
-        verified: this.local.verified(member.handle),
-        joined_at: member.joinedAt,
-        removed_at: member.removedAt,
-      })),
+      members: this.local.members(topicId).map((member) => {
+        const contact = this.#contactView(member.handle);
+        const self = member.handle === this.credential.handle;
+        return {
+          handle: member.handle,
+          role: member.role,
+          fingerprint: contact?.fingerprint ?? (self ? this.fingerprint() : ''),
+          verified: self ? !contact?.key_changed : (contact?.verified ?? false),
+          key_changed: contact?.key_changed ?? false,
+          joined_at: member.joinedAt,
+          removed_at: member.removedAt,
+        };
+      }),
     };
   }
 
@@ -396,6 +435,7 @@ export class Bridge {
     this.#requireScope(agent, topicId);
     const session = this.#requireActive(topicId);
     if (session.role === 'owner') {
+      await this.#observeHandle(handle);
       const approvalId = newApprovalId();
       this.local.saveApproval({
         approvalId,
@@ -578,10 +618,12 @@ export class Bridge {
     try {
       if (row.kind === 'join') {
         await this.#session(row.topicId).acceptJoin();
+        this.#rememberCommit(row.topicId, Date.now());
         this.local.decideApproval(approvalId, 'done');
         return { status: 'approved' };
       }
       if (row.kind === 'invite') {
+        await this.#requireTrustedContact((row.request as { handle?: string }).handle ?? '');
         const seq = await this.#commitInvite(row, key);
         if (seq < 0) return { status: 'pending' };
         this.local.decideApproval(approvalId, 'done');
@@ -644,6 +686,140 @@ export class Bridge {
   async selfUpdate(topicId: string): Promise<number> {
     const session = this.#requireActive(topicId);
     return this.#sendCommit(session, {});
+  }
+
+  /**
+   * Commit a self-Update in every active topic this bridge has not committed
+   * in for 7 days. A missing clock (an upgrade, or a lost row) is due: waiting
+   * another week would skip the rotation. The clock is the stored commit time,
+   * so a restart does not postpone it.
+   */
+  async runDueSelfUpdates(now = Date.now()): Promise<string[]> {
+    const updated: string[] = [];
+    for (const [topicId, session] of this.#sessions) {
+      if (session.status !== 'active') continue;
+      const last = this.#clampCommitClock(topicId, this.local.lastCommitAt(topicId), now);
+      if (last !== undefined && now - last < SELF_UPDATE_INTERVAL_MS) continue;
+      try {
+        await this.selfUpdate(topicId);
+        this.#rememberCommit(topicId, now);
+        updated.push(topicId);
+      } catch {
+        // Leave the clock unchanged so the next deadline still fires.
+      }
+    }
+    this.#armSelfUpdateTimer();
+    return updated;
+  }
+
+  /** Next time a self-update is due, or undefined when nothing is scheduled. */
+  nextSelfUpdateAt(): number | undefined {
+    return this.#nextSelfUpdateAt;
+  }
+
+  /** Read the commit clock and arm a timer for the soonest deadline. */
+  rescheduleSelfUpdates(): number | undefined {
+    this.#armSelfUpdateTimer();
+    return this.#nextSelfUpdateAt;
+  }
+
+  /** Sleep actually passed to the timer. Capped; not the full time until the deadline. */
+  selfUpdateWakeDelay(): number | undefined {
+    return this.#wakeDelayMs;
+  }
+
+  listContacts(): ContactView[] {
+    return this.local
+      .contacts()
+      .filter((contact) => contact.handle !== this.credential.handle)
+      .map((contact) => this.#viewContact(contact))
+      .filter((contact): contact is ContactView => contact !== undefined);
+  }
+
+  contact(handle: string): ContactView | undefined {
+    return this.#contactView(handle);
+  }
+
+  /**
+   * Pin on first sight. A different key is recorded and not adopted.
+   * Returns the contact as it stands after this observation.
+   */
+  observeContact(handle: string, observed: Uint8Array): ContactView {
+    if (handle === this.credential.handle) {
+      const ours = this.credential.identityKey;
+      if (!this.mls.pins.has(handle)) this.mls.pinIdentity({ handle, identityKey: ours });
+      if (bytesEqual(observed, ours)) this.local.clearPending(handle);
+      else this.local.noteKeyChange(handle, observed);
+      return this.#contactView(handle) ?? this.#selfView();
+    }
+    const pinned = this.mls.pins.get(handle);
+    if (!pinned) {
+      this.mls.pinIdentity({ handle, identityKey: observed });
+      return this.#contactView(handle) ?? this.#selfView();
+    }
+    if (bytesEqual(pinned, observed)) this.local.clearPending(handle);
+    else this.local.noteKeyChange(handle, observed);
+    const view = this.#contactView(handle);
+    if (!view) throw new BridgeError('mls_error', 'contact pin was not stored', 500);
+    return view;
+  }
+
+  /** Human command. The passphrase proves the person; the fingerprint is the out-of-band check. */
+  verifyContact(handle: string, presented: string, passphrase: string): ContactView {
+    this.provePassphrase(passphrase);
+    const digits = parseFingerprint(presented);
+    if (!digits) {
+      throw new BridgeError('invalid_request', 'fingerprint must be 60 digits or an agbfp:v1 QR payload');
+    }
+    const record = this.local.contact(handle);
+    if (!record) throw new BridgeError('not_found', 'no such contact', 404);
+    const pinnedDigits = fingerprintDigits(record.identityKey);
+    const pendingDigits = record.pendingKey ? fingerprintDigits(record.pendingKey) : undefined;
+    if (handle === this.credential.handle && digits !== fingerprintDigits(this.credential.identityKey)) {
+      throw new BridgeError('invalid_request', 'this bridge will not replace its own identity key');
+    }
+    if (pendingDigits && digits === pendingDigits && record.pendingKey) {
+      // The leaf credential in an existing group still carries the pinned key.
+      // Replacing the pin now would make the next message from that member fail
+      // credential checks. They have to be removed, then added with the new key.
+      if (this.#memberOfTopic(handle)) {
+        throw new BridgeError('contact_key_changed', keyChangeRecovery(handle, true), 409, {
+          handle,
+          recovery: 'remove_then_readd',
+        });
+      }
+      this.mls.rePin(handle, record.pendingKey);
+      this.local.clearPending(handle);
+      this.local.markVerified(handle);
+      const view = this.#contactView(handle);
+      if (!view) throw new BridgeError('mls_error', 'contact pin was not stored', 500);
+      return view;
+    }
+    if (digits === pinnedDigits) {
+      this.local.markVerified(handle);
+      const view = this.#contactView(handle);
+      if (!view) throw new BridgeError('mls_error', 'contact pin was not stored', 500);
+      return view;
+    }
+    throw new BridgeError('invalid_request', 'fingerprint does not match the pinned key or the pending key');
+  }
+
+  async approvalDetail(agent: AgentCaller, approvalId: string): Promise<Record<string, unknown>> {
+    const row = this.local.approval(approvalId);
+    if (!row) throw new BridgeError('not_found', 'no such approval', 404);
+    if (!inScope(agent, row.topicId)) throw new BridgeError('out_of_scope', 'this agent cannot use that topic', 403);
+    return this.#approvalDetail(row);
+  }
+
+  /** Every approval, for the local page. Not scoped to an agent token. */
+  async humanApproval(approvalId: string): Promise<Record<string, unknown>> {
+    const row = this.local.approval(approvalId);
+    if (!row) throw new BridgeError('not_found', 'no such approval', 404);
+    return this.#approvalDetail(row);
+  }
+
+  humanApprovals(status = 'pending'): Array<Record<string, unknown>> {
+    return this.local.approvals('*', status).map((row) => approvalView(row));
   }
 
   async #publishPatch(
@@ -846,6 +1022,7 @@ export class Bridge {
           const posted = await this.relay.post(session.topicId, staged);
           if (posted.ok) {
             await this.#finishPost(session, posted.seq);
+            this.#rememberCommit(session.topicId, Date.now());
             return posted.seq;
           }
           if (posted.code === 'stale_epoch') {
@@ -973,6 +1150,7 @@ export class Bridge {
         return row.topicId === topicId && row.kind === kind && (row.request as { handle?: string }).handle === payload.handle;
       });
       if (existing) return;
+      await this.#observeHandle(payload.handle);
       this.local.saveApproval({
         approvalId: newApprovalId(),
         topicId,
@@ -1039,6 +1217,15 @@ export class Bridge {
       if (!request.awaitingKeyPackage || !request.signature || !request.deviceId || request.expiresAt === undefined) continue;
       if (request.expiresAt <= now) {
         this.local.decideApproval(row.approvalId, 'expired');
+        continue;
+      }
+      const handle = (row.request as { handle?: string }).handle;
+      // Any trust-check failure leaves the stored signature unclaimed. A
+      // changed key, a missing pin row, or a relay miss must not add anyone.
+      if (!handle) continue;
+      try {
+        await this.#requireTrustedContact(handle);
+      } catch {
         continue;
       }
       const signature = new Uint8Array(Buffer.from(request.signature, 'base64'));
@@ -1150,6 +1337,167 @@ export class Bridge {
       .filter((member) => member.removedAt === null && !present.has(member.handle))
       .map((member) => member.handle);
     if (gone.length > 0) this.local.markRemoved(session.topicId, gone, now);
+  }
+
+  #memberOfTopic(handle: string): boolean {
+    for (const session of this.#sessions.values()) {
+      if (session.status === 'left' || session.status === 'closed') continue;
+      if (session.members().some((member) => member.credential.handle === handle)) return true;
+    }
+    return false;
+  }
+
+  #rememberCommit(topicId: string, at: number): void {
+    this.local.noteCommit(topicId, at);
+    this.#armSelfUpdateTimer();
+  }
+
+  /** A commit timestamp ahead of the wall clock is skew. Treat it as now. */
+  #clampCommitClock(topicId: string, last: number | undefined, now: number): number | undefined {
+    if (last === undefined || last <= now) return last;
+    this.local.noteCommit(topicId, now);
+    return now;
+  }
+
+  /**
+   * One timer for the soonest stored deadline. The sleep passed to setTimeout
+   * is capped at 24 hours and at 2^31-1 ms. A wake before the deadline reads
+   * the stored clock again. Overdue topics are not scheduled here: startup
+   * already commits those.
+   */
+  #armSelfUpdateTimer(): void {
+    if (this.#selfUpdateTimer) clearTimeout(this.#selfUpdateTimer);
+    this.#selfUpdateTimer = undefined;
+    this.#nextSelfUpdateAt = undefined;
+    this.#wakeDelayMs = undefined;
+    if (this.#closed) return;
+    let soonest: number | undefined;
+    let overdue = false;
+    const now = Date.now();
+    for (const [topicId, session] of this.#sessions) {
+      if (session.status !== 'active') continue;
+      const last = this.#clampCommitClock(topicId, this.local.lastCommitAt(topicId), now);
+      const dueAt = last === undefined ? now : last + SELF_UPDATE_INTERVAL_MS;
+      if (dueAt <= now) {
+        // A failed commit leaves the deadline in the past. Try again shortly
+        // instead of waiting for the next process start.
+        overdue = true;
+        continue;
+      }
+      if (soonest === undefined || dueAt < soonest) soonest = dueAt;
+    }
+    if (overdue) {
+      const retryAt = now + 30_000;
+      if (soonest === undefined || retryAt < soonest) soonest = retryAt;
+    }
+    if (soonest === undefined) return;
+    this.#nextSelfUpdateAt = soonest;
+    const delay = selfUpdateTimerDelay(soonest, Date.now());
+    this.#wakeDelayMs = delay;
+    this.#selfUpdateTimer = setTimeout(() => {
+      this.#selfUpdateTimer = undefined;
+      if (this.#closed) return;
+      void this.runDueSelfUpdates().catch(() => this.#armSelfUpdateTimer());
+    }, delay);
+    this.#selfUpdateTimer.unref();
+  }
+
+  async #refreshContacts(): Promise<void> {
+    for (const handle of [...this.mls.pins.keys()]) {
+      try {
+        const account = await this.relay.account(handle);
+        this.observeContact(handle, account.identityKey);
+      } catch {
+        // A relay miss leaves the last observation in place. It does not unpin.
+      }
+    }
+  }
+
+  async #observeHandle(handle: string): Promise<void> {
+    try {
+      const account = await this.relay.account(handle);
+      this.observeContact(handle, account.identityKey);
+    } catch {
+      // Approve checks again. A missing account does not block creating the request.
+    }
+  }
+
+  async #requireTrustedContact(handle: string): Promise<ContactView> {
+    if (!handle) throw new BridgeError('invalid_request', 'contact handle is required');
+    const account = await this.relay.account(handle);
+    const view = this.observeContact(handle, account.identityKey);
+    if (view.key_changed) {
+      const member = this.#memberOfTopic(handle);
+      throw new BridgeError('contact_key_changed', keyChangeRecovery(handle, member), 409, {
+        handle,
+        recovery: member ? 'remove_then_readd' : 'verify',
+        pinned_fingerprint: view.fingerprint,
+        pending_fingerprint: view.pending_fingerprint,
+      });
+    }
+    return view;
+  }
+
+  #contactView(handle: string): ContactView | undefined {
+    if (handle === this.credential.handle) {
+      const record = this.local.contact(handle);
+      if (!record) return this.#selfView();
+      return this.#viewContact(record, true);
+    }
+    const record = this.local.contact(handle);
+    return record ? this.#viewContact(record, false) : undefined;
+  }
+
+  #viewContact(
+    record: { handle: string; identityKey: Uint8Array; verifiedAt: string | null; pendingKey: Uint8Array | null },
+    self = false,
+  ): ContactView {
+    const keyChanged = record.pendingKey !== null;
+    return {
+      handle: record.handle,
+      fingerprint: fingerprint(record.identityKey),
+      qr_payload: fingerprintQrPayload(record.identityKey),
+      verified: !keyChanged && (self || record.verifiedAt !== null),
+      key_changed: keyChanged,
+      pending_fingerprint: record.pendingKey ? fingerprint(record.pendingKey) : null,
+      pending_qr_payload: record.pendingKey ? fingerprintQrPayload(record.pendingKey) : null,
+      verified_at: record.verifiedAt,
+    };
+  }
+
+  #selfView(): ContactView {
+    return {
+      handle: this.credential.handle,
+      fingerprint: this.fingerprint(),
+      qr_payload: fingerprintQrPayload(this.credential.identityKey),
+      verified: true,
+      key_changed: false,
+      pending_fingerprint: null,
+      pending_qr_payload: null,
+      verified_at: null,
+    };
+  }
+
+  async #approvalDetail(row: ApprovalRow): Promise<Record<string, unknown>> {
+    const state = this.local.state(row.topicId);
+    const meta = metaOf(state?.doc);
+    const request = isRecord(row.request) ? row.request : {};
+    const handle =
+      typeof request.handle === 'string' ? request.handle : typeof request.owner === 'string' ? request.owner : undefined;
+    let contact: ContactView | undefined;
+    if (handle) {
+      await this.#observeHandle(handle);
+      contact = this.#contactView(handle);
+    }
+    const policy = loadPolicy(this.paths.policy);
+    return {
+      ...approvalView(row),
+      request,
+      topic_title: meta.title,
+      topic_slug: meta.slug,
+      sensitive_paths: sensitivePaths(row, policy),
+      ...(contact ? { contact } : {}),
+    };
   }
 
   #pendingApproval(approvalId: string): ApprovalRow {
@@ -1274,7 +1622,37 @@ function approvalView(row: ApprovalRow): Record<string, unknown> {
     requested_by: row.requestedBy,
     created_at: row.createdAt,
     decided_at: row.decidedAt,
+    hold: holdKind(row),
   };
+}
+
+function keyChangeRecovery(handle: string, stillMember: boolean): string {
+  if (stillMember) {
+    return `${handle}'s identity key changed while they are still a member. Recovery is remove, then re-add: remove ${handle} from the topic, compare the new fingerprint out of band, run agb contact verify ${handle} <fingerprint>, then invite ${handle} again.`;
+  }
+  return `${handle}'s identity key changed. Compare the new fingerprint out of band and run agb contact verify ${handle} <fingerprint> before trusting it. An add stays blocked until then.`;
+}
+
+function holdKind(row: ApprovalRow): string | null {
+  if (row.kind === 'state_change') return 'sensitive_path';
+  if (row.kind !== 'request' || !isRecord(row.request)) return null;
+  const payload = row.request.payload;
+  if (!isRecord(payload) || typeof payload.kind !== 'string') return null;
+  if (payload.kind === 'spend' || payload.kind === 'external_message') return payload.kind;
+  return null;
+}
+
+function sensitivePaths(row: ApprovalRow, policy: ReturnType<typeof loadPolicy>): string[] {
+  if (row.kind !== 'state_change' || !isRecord(row.request) || !Array.isArray(row.request.patch)) return [];
+  const found: string[] = [];
+  for (const op of row.request.patch) {
+    if (!isRecord(op)) continue;
+    for (const key of ['path', 'from']) {
+      const pointer = op[key];
+      if (typeof pointer === 'string' && pathIsSensitive(policy, pointer) && !found.includes(pointer)) found.push(pointer);
+    }
+  }
+  return found;
 }
 
 function metaOf(doc: unknown): { slug: string; title: string } {

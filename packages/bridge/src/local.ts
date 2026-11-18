@@ -1,10 +1,14 @@
 // Bridge rows that sit beside the MLS store in the same SQLite file.
-// Plaintext messages and shared state are written here. Secrets are not:
-// the MLS store seals those before they reach disk.
+// Envelope body and payload are sealed with the storage key before they reach
+// disk. The shared-state document is not. Secrets that the MLS store already
+// seals are not written here.
 
 import { DatabaseSync } from 'node:sqlite';
-import { bytesEqual } from '@agent-bridge/protocol';
-import type { Envelope, PersistedFrame, StoreDb } from '@agent-bridge/mls';
+import { existsSync, unlinkSync } from 'node:fs';
+import { bytesEqual, fromUtf8, utf8 } from '@agent-bridge/protocol';
+import { pendingManifestAad } from '@agent-bridge/mls';
+import type { Envelope, PersistedFrame, SecretSealer, StoreDb } from '@agent-bridge/mls';
+import { BridgeError } from './errors.ts';
 import { applyPatch, hashBytes, parseHashLabel } from './json.ts';
 import type { PatchOp } from './json.ts';
 import { verifyRequest, verifyState } from './signatures.ts';
@@ -48,6 +52,14 @@ export interface TokenRow {
   revokedAt: string | null;
 }
 
+export interface ContactRecord {
+  handle: string;
+  identityKey: Uint8Array;
+  verifiedAt: string | null;
+  pendingKey: Uint8Array | null;
+  pendingAt: string | null;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS identity (
   handle TEXT PRIMARY KEY,
@@ -80,8 +92,10 @@ CREATE TABLE IF NOT EXISTS approvals (
   kind TEXT NOT NULL,
   status TEXT NOT NULL,
   requested_by TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  request_json TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  request_json TEXT NOT NULL DEFAULT '',
+  summary_sealed BLOB,
+  request_sealed BLOB,
   created_at TEXT NOT NULL,
   decided_at TEXT
 );
@@ -89,7 +103,8 @@ CREATE TABLE IF NOT EXISTS topic_state (
   topic_id TEXT PRIMARY KEY,
   version INTEGER NOT NULL,
   doc_hash BLOB NOT NULL,
-  doc_json TEXT NOT NULL,
+  doc_json TEXT NOT NULL DEFAULT '',
+  doc_sealed BLOB,
   updated_seq INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS envelopes (
@@ -100,11 +115,17 @@ CREATE TABLE IF NOT EXISTS envelopes (
   author_agent TEXT,
   type TEXT NOT NULL,
   body TEXT,
-  payload_json TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '',
   approval_ok INTEGER NOT NULL,
   applied INTEGER,
   ts TEXT NOT NULL,
+  body_sealed BLOB,
+  payload_sealed BLOB,
   PRIMARY KEY (topic_id, seq)
+);
+CREATE TABLE IF NOT EXISTS commit_clock (
+  topic_id TEXT PRIMARY KEY,
+  last_commit_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS member_seen (
   topic_id TEXT NOT NULL,
@@ -118,20 +139,15 @@ CREATE TABLE IF NOT EXISTS member_seen (
 
 export class LocalStore {
   readonly db: DatabaseSync;
+  readonly #sealer: SecretSealer | undefined;
 
-  constructor(path: string) {
+  constructor(path: string, options?: { sealer?: SecretSealer }) {
+    this.#sealer = options?.sealer;
     this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA secure_delete = ON');
     this.db.exec('PRAGMA busy_timeout = 1000');
     this.db.exec(SCHEMA);
-    const names = new Set(
-      this.db
-        .prepare('PRAGMA table_info(contacts)')
-        .all()
-        .map((row) => String(row.name)),
-    );
-    if (names.size > 0 && !names.has('verified_at')) {
-      this.db.exec('ALTER TABLE contacts ADD COLUMN verified_at TEXT');
-    }
+    this.#migrate();
   }
 
   close(): void {
@@ -234,11 +250,12 @@ export class LocalStore {
     const envelope = frame.envelope;
     if (!envelope) return undefined;
     const approvalOk = envelope.approval !== null && approvalVerifies(frame, envelope);
+    const sealed = this.#sealEnvelope(frame.topicId, frame.seq, envelope);
     db.prepare(
       `INSERT INTO envelopes (
          topic_id, seq, message_id, author_handle, author_agent, type, body, payload_json,
-         approval_ok, applied, ts
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+         approval_ok, applied, ts, body_sealed, payload_sealed
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
     ).run(
       frame.topicId,
       frame.seq,
@@ -246,25 +263,28 @@ export class LocalStore {
       envelope.author.handle,
       envelope.author.agent ?? null,
       envelope.type,
-      envelope.body ?? null,
-      JSON.stringify(envelope.payload),
+      sealed.body,
+      sealed.payloadJson,
       approvalOk ? 1 : 0,
       envelope.ts,
+      sealed.bodySealed,
+      sealed.payloadSealed,
     );
-    if (envelope.type === 'state_snapshot') return applySnapshot(db, frame.topicId, frame.seq, envelope);
-    if (envelope.type === 'state_patch') return applyStatePatch(db, frame.topicId, frame.seq, envelope);
+    if (envelope.type === 'state_snapshot') return applySnapshot(db, frame.topicId, frame.seq, envelope, this.#sealer);
+    if (envelope.type === 'state_patch') return applyStatePatch(db, frame.topicId, frame.seq, envelope, this.#sealer);
     return undefined;
   }
 
   state(topicId: string): TopicStateRow | undefined {
     const row = this.db
-      .prepare('SELECT version, doc_hash, doc_json, updated_seq FROM topic_state WHERE topic_id = ?')
+      .prepare('SELECT version, doc_hash, doc_json, doc_sealed, updated_seq FROM topic_state WHERE topic_id = ?')
       .get(topicId);
     if (!row) return undefined;
+    const version = Number(row.version);
     return {
-      version: Number(row.version),
+      version,
       hash: bytes(row.doc_hash),
-      doc: JSON.parse(String(row.doc_json)),
+      doc: this.#readDoc(row, topicId, version),
       updatedSeq: Number(row.updated_seq),
     };
   }
@@ -272,11 +292,12 @@ export class LocalStore {
   envelopes(topicId: string, afterSeq: number, limit: number): EnvelopeRow[] {
     return this.db
       .prepare(
-        `SELECT seq, message_id, author_handle, author_agent, type, body, payload_json, approval_ok, applied, ts
+        `SELECT topic_id, seq, message_id, author_handle, author_agent, type, body, payload_json,
+                approval_ok, applied, ts, body_sealed, payload_sealed
            FROM envelopes WHERE topic_id = ? AND seq > ? ORDER BY seq LIMIT ?`,
       )
       .all(topicId, afterSeq, limit)
-      .map(envelopeRow);
+      .map((row) => this.#envelopeRow(row));
   }
 
   cursor(label: string, topicId: string): number {
@@ -320,23 +341,35 @@ export class LocalStore {
     summary: string;
     request: unknown;
   }): void {
+    const sealed = this.#sealApproval(row.approvalId, row.summary, JSON.stringify(row.request));
     this.db
       .prepare(
         `INSERT INTO approvals (
-           approval_id, topic_id, kind, status, requested_by, summary, request_json, created_at
-         ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`,
+           approval_id, topic_id, kind, status, requested_by, summary, request_json,
+           summary_sealed, request_sealed, created_at
+         ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
       )
-      .run(row.approvalId, row.topicId, row.kind, row.requestedBy, row.summary, JSON.stringify(row.request), new Date().toISOString());
+      .run(
+        row.approvalId,
+        row.topicId,
+        row.kind,
+        row.requestedBy,
+        sealed.summary,
+        sealed.requestJson,
+        sealed.summarySealed,
+        sealed.requestSealed,
+        new Date().toISOString(),
+      );
   }
 
   approval(id: string): ApprovalRow | undefined {
     const row = this.db.prepare('SELECT * FROM approvals WHERE approval_id = ?').get(id);
-    return row ? approvalRow(row) : undefined;
+    return row ? this.#approvalFrom(row) : undefined;
   }
 
   approvals(topicIds: '*' | string[], status: string): ApprovalRow[] {
     const rows = this.db.prepare('SELECT * FROM approvals ORDER BY created_at').all();
-    return rows.map(approvalRow).filter((row) => {
+    return rows.map((row) => this.#approvalFrom(row)).filter((row) => {
       if (status !== 'all' && row.status !== status) return false;
       if (topicIds === '*') return true;
       return topicIds.includes(row.topicId);
@@ -344,7 +377,14 @@ export class LocalStore {
   }
 
   updateRequest(id: string, request: unknown): void {
-    this.db.prepare('UPDATE approvals SET request_json = ? WHERE approval_id = ?').run(JSON.stringify(request), id);
+    const json = JSON.stringify(request);
+    if (!this.#sealer) {
+      this.db.prepare('UPDATE approvals SET request_json = ? WHERE approval_id = ?').run(json, id);
+      return;
+    }
+    this.db
+      .prepare('UPDATE approvals SET request_json = \'\', request_sealed = ? WHERE approval_id = ?')
+      .run(this.#sealText(json, approvalRequestAad(id)), id);
   }
 
   decideApproval(id: string, status: 'approved' | 'rejected' | 'done' | 'expired'): void {
@@ -393,12 +433,358 @@ export class LocalStore {
   }
 
   verified(handle: string): boolean {
-    const row = this.db.prepare('SELECT verified_at FROM contacts WHERE handle = ?').get(handle);
-    return row !== undefined && row.verified_at !== null;
+    const row = this.contact(handle);
+    return row !== undefined && row.verifiedAt !== null && row.pendingKey === null;
+  }
+
+  keyChanged(handle: string): boolean {
+    return this.contact(handle)?.pendingKey != null;
+  }
+
+  contact(handle: string): ContactRecord | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT handle, identity_pubkey, verified_at, pending_pubkey, pending_at
+           FROM contacts WHERE handle = ?`,
+      )
+      .get(handle);
+    return row ? contactRecord(row) : undefined;
+  }
+
+  contacts(): ContactRecord[] {
+    return this.db
+      .prepare(
+        `SELECT handle, identity_pubkey, verified_at, pending_pubkey, pending_at
+           FROM contacts ORDER BY handle`,
+      )
+      .all()
+      .map(contactRecord);
+  }
+
+  /** Remember a relay key that is not the pin. The pin itself is not updated. */
+  noteKeyChange(handle: string, pending: Uint8Array): void {
+    const current = this.contact(handle);
+    if (!current) return;
+    if (current.pendingKey && bytesEqual(current.pendingKey, pending)) return;
+    this.db
+      .prepare('UPDATE contacts SET pending_pubkey = ?, pending_at = ? WHERE handle = ?')
+      .run(pending, new Date().toISOString(), handle);
+  }
+
+  clearPending(handle: string): void {
+    this.db.prepare('UPDATE contacts SET pending_pubkey = NULL, pending_at = NULL WHERE handle = ?').run(handle);
+  }
+
+  markVerified(handle: string): void {
+    const result = this.db
+      .prepare('UPDATE contacts SET verified_at = ? WHERE handle = ?')
+      .run(new Date().toISOString(), handle);
+    if (result.changes !== 1) throw new BridgeError('not_found', 'no such contact', 404);
+  }
+
+  noteCommit(topicId: string, at: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO commit_clock (topic_id, last_commit_at) VALUES (?, ?)
+         ON CONFLICT (topic_id) DO UPDATE SET last_commit_at = excluded.last_commit_at`,
+      )
+      .run(topicId, at);
+  }
+
+  lastCommitAt(topicId: string): number | undefined {
+    const row = this.db.prepare('SELECT last_commit_at FROM commit_clock WHERE topic_id = ?').get(topicId);
+    if (!row) return undefined;
+    return Number(row.last_commit_at);
+  }
+
+  #migrate(): void {
+    const envelopes = columnSet(this.db, 'envelopes');
+    if (envelopes.size > 0 && !envelopes.has('body_sealed')) {
+      this.db.exec('ALTER TABLE envelopes ADD COLUMN body_sealed BLOB');
+      this.db.exec('ALTER TABLE envelopes ADD COLUMN payload_sealed BLOB');
+    }
+    const contacts = columnSet(this.db, 'contacts');
+    if (contacts.size > 0 && !contacts.has('verified_at')) {
+      this.db.exec('ALTER TABLE contacts ADD COLUMN verified_at TEXT');
+    }
+    if (contacts.size > 0 && !contacts.has('pending_pubkey')) {
+      this.db.exec('ALTER TABLE contacts ADD COLUMN pending_pubkey BLOB');
+      this.db.exec('ALTER TABLE contacts ADD COLUMN pending_at TEXT');
+    }
+    const stateCols = columnSet(this.db, 'topic_state');
+    if (stateCols.size > 0 && !stateCols.has('doc_sealed')) {
+      this.db.exec('ALTER TABLE topic_state ADD COLUMN doc_sealed BLOB');
+    }
+    const approvalCols = columnSet(this.db, 'approvals');
+    if (approvalCols.size > 0 && !approvalCols.has('summary_sealed')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN summary_sealed BLOB');
+      this.db.exec('ALTER TABLE approvals ADD COLUMN request_sealed BLOB');
+    }
+    if (this.#sealer) this.#migratePlaintext();
+  }
+
+  /**
+   * Rewrite the file so freed pages cannot keep old plaintext, then drop WAL
+   * and rollback-journal sidecars. The caller must be the only connection.
+   */
+  scrubDisk(): void {
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    this.db.exec('VACUUM');
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  }
+
+  /** Seal rows written before plaintext was wrapped. Plaintext columns are cleared. */
+  #migratePlaintext(): void {
+    const rows = this.db
+      .prepare('SELECT topic_id, seq, body, payload_json, body_sealed, payload_sealed FROM envelopes')
+      .all();
+    const update = this.db.prepare(
+      `UPDATE envelopes SET body = NULL, payload_json = '', body_sealed = ?, payload_sealed = ?
+        WHERE topic_id = ? AND seq = ?`,
+    );
+    const stateRows = this.db
+      .prepare('SELECT topic_id, version, doc_json, doc_sealed FROM topic_state')
+      .all();
+    const updateState = this.db.prepare(
+      'UPDATE topic_state SET doc_json = \'\', doc_sealed = ? WHERE topic_id = ? AND version = ?',
+    );
+    const pendingCols = columnSet(this.db, 'pending_outbound');
+    if (pendingCols.size > 0 && !pendingCols.has('manifest_sealed')) {
+      this.db.exec('ALTER TABLE pending_outbound ADD COLUMN manifest_sealed BLOB');
+    }
+    const pendingRows =
+      pendingCols.size === 0
+        ? []
+        : this.db.prepare('SELECT topic_id, manifest_json, manifest_sealed FROM pending_outbound').all();
+    const updatePending =
+      pendingCols.size === 0
+        ? undefined
+        : this.db.prepare('UPDATE pending_outbound SET manifest_json = \'\', manifest_sealed = ? WHERE topic_id = ?');
+    const approvalRows = this.db
+      .prepare('SELECT approval_id, summary, request_json, summary_sealed, request_sealed FROM approvals')
+      .all();
+    const updateApproval = this.db.prepare(
+      `UPDATE approvals SET summary = '', request_json = '', summary_sealed = ?, request_sealed = ?
+        WHERE approval_id = ?`,
+    );
+    let migrated = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        if (row.body_sealed != null || row.payload_sealed != null) continue;
+        const topicId = String(row.topic_id);
+        const seq = Number(row.seq);
+        const body = row.body === null || row.body === undefined ? null : String(row.body);
+        const payload = row.payload_json === null || row.payload_json === undefined ? '{}' : String(row.payload_json);
+        if (body === null && payload === '') continue;
+        update.run(
+          body === null ? null : this.#sealText(body, bodyAad(topicId, seq)),
+          this.#sealText(payload === '' ? '{}' : payload, payloadAad(topicId, seq)),
+          topicId,
+          seq,
+        );
+        migrated += 1;
+      }
+      for (const row of stateRows) {
+        if (row.doc_sealed != null) continue;
+        const json = row.doc_json === null || row.doc_json === undefined ? '' : String(row.doc_json);
+        if (json === '') continue;
+        const topicId = String(row.topic_id);
+        const version = Number(row.version);
+        updateState.run(this.#sealText(json, stateAad(topicId, version)), topicId, version);
+        migrated += 1;
+      }
+      for (const row of pendingRows) {
+        if (row.manifest_sealed != null) continue;
+        const json = row.manifest_json === null || row.manifest_json === undefined ? '' : String(row.manifest_json);
+        if (json === '') continue;
+        const topicId = String(row.topic_id);
+        updatePending!.run(this.#sealText(json, pendingManifestAad(topicId)), topicId);
+        migrated += 1;
+      }
+      for (const row of approvalRows) {
+        if (row.summary_sealed != null || row.request_sealed != null) continue;
+        const id = String(row.approval_id);
+        const summary = row.summary === null || row.summary === undefined ? '' : String(row.summary);
+        const requestJson = row.request_json === null || row.request_json === undefined ? '' : String(row.request_json);
+        if (summary === '' && requestJson === '') continue;
+        updateApproval.run(
+          this.#sealText(summary, approvalSummaryAad(id)),
+          this.#sealText(requestJson === '' ? '{}' : requestJson, approvalRequestAad(id)),
+          id,
+        );
+        migrated += 1;
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    // Free pages and the WAL keep the pre-image until the file is rebuilt.
+    // This connection is the only one open while that happens (see scrubPlaintext).
+    if (migrated > 0) this.scrubDisk();
+  }
+
+  #sealApproval(
+    id: string,
+    summary: string,
+    requestJson: string,
+  ): { summary: string; requestJson: string; summarySealed: Uint8Array | null; requestSealed: Uint8Array | null } {
+    if (!this.#sealer) return { summary, requestJson, summarySealed: null, requestSealed: null };
+    return {
+      summary: '',
+      requestJson: '',
+      summarySealed: this.#sealText(summary, approvalSummaryAad(id)),
+      requestSealed: this.#sealText(requestJson, approvalRequestAad(id)),
+    };
+  }
+
+  #approvalFrom(row: Record<string, unknown>): ApprovalRow {
+    const id = String(row.approval_id);
+    return {
+      approvalId: id,
+      topicId: String(row.topic_id),
+      kind: String(row.kind),
+      status: String(row.status),
+      requestedBy: String(row.requested_by),
+      summary: this.#readApprovalText(row.summary_sealed, row.summary, approvalSummaryAad(id)),
+      request: JSON.parse(this.#readApprovalText(row.request_sealed, row.request_json, approvalRequestAad(id)) || '{}'),
+      createdAt: String(row.created_at),
+      decidedAt: row.decided_at === null ? null : String(row.decided_at),
+    };
+  }
+
+  #readApprovalText(sealed: unknown, legacy: unknown, aad: string): string {
+    if (sealed != null) return this.#openText(bytes(sealed), aad);
+    if (typeof legacy === 'string') return legacy;
+    return '';
+  }
+
+  #readDoc(row: Record<string, unknown>, topicId: string, version: number): unknown {
+    if (row.doc_sealed != null) return JSON.parse(this.#openText(bytes(row.doc_sealed), stateAad(topicId, version)));
+    if (typeof row.doc_json === 'string' && row.doc_json.length > 0) return JSON.parse(row.doc_json);
+    return {};
+  }
+
+  #sealEnvelope(
+    topicId: string,
+    seq: number,
+    envelope: Envelope,
+  ): { body: string | null; payloadJson: string; bodySealed: Uint8Array | null; payloadSealed: Uint8Array | null } {
+    const payload = JSON.stringify(envelope.payload);
+    if (!this.#sealer) {
+      return { body: envelope.body ?? null, payloadJson: payload, bodySealed: null, payloadSealed: null };
+    }
+    return {
+      body: null,
+      payloadJson: '',
+      bodySealed: envelope.body === undefined ? null : this.#sealText(envelope.body, bodyAad(topicId, seq)),
+      payloadSealed: this.#sealText(payload, payloadAad(topicId, seq)),
+    };
+  }
+
+  #sealText(plain: string, aad: string): Uint8Array {
+    if (!this.#sealer) throw new BridgeError('mls_error', 'storage key is missing', 500);
+    return this.#sealer.seal(utf8(plain), utf8(aad));
+  }
+
+  #openText(sealed: Uint8Array, aad: string): string {
+    if (!this.#sealer) throw new BridgeError('mls_error', 'stored message could not be opened', 500);
+    try {
+      return fromUtf8(this.#sealer.open(sealed, utf8(aad)));
+    } catch (err) {
+      if (err instanceof BridgeError) throw err;
+      throw new BridgeError('mls_error', 'stored message could not be opened', 500);
+    }
+  }
+
+  #envelopeRow(row: Record<string, unknown>): EnvelopeRow {
+    const topicId = String(row.topic_id);
+    const seq = Number(row.seq);
+    return {
+      seq,
+      messageId: String(row.message_id),
+      authorHandle: String(row.author_handle),
+      authorAgent: row.author_agent === null ? null : String(row.author_agent),
+      type: String(row.type),
+      body: this.#readBody(row, topicId, seq),
+      payload: this.#readPayload(row, topicId, seq),
+      approvalOk: Number(row.approval_ok) === 1,
+      applied: row.applied === null ? null : Number(row.applied) === 1,
+      ts: String(row.ts),
+    };
+  }
+
+  #readBody(row: Record<string, unknown>, topicId: string, seq: number): string | null {
+    if (row.body_sealed != null) return this.#openText(bytes(row.body_sealed), bodyAad(topicId, seq));
+    if (row.body === null || row.body === undefined) return null;
+    return String(row.body);
+  }
+
+  #readPayload(row: Record<string, unknown>, topicId: string, seq: number): unknown {
+    if (row.payload_sealed != null) {
+      return JSON.parse(this.#openText(bytes(row.payload_sealed), payloadAad(topicId, seq)));
+    }
+    if (typeof row.payload_json === 'string' && row.payload_json.length > 0) return JSON.parse(row.payload_json);
+    return {};
   }
 }
 
-function applySnapshot(db: StoreDb, topicId: string, seq: number, envelope: Envelope): string | undefined {
+function bodyAad(topicId: string, seq: number): string {
+  return `envelope-body:${topicId}:${seq}`;
+}
+
+function payloadAad(topicId: string, seq: number): string {
+  return `envelope-payload:${topicId}:${seq}`;
+}
+
+function columnSet(db: DatabaseSync, table: string): Set<string> {
+  return new Set(
+    db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .map((row) => String(row.name)),
+  );
+}
+
+function contactRecord(row: Record<string, unknown>): ContactRecord {
+  return {
+    handle: String(row.handle),
+    identityKey: bytes(row.identity_pubkey),
+    verifiedAt: row.verified_at === null || row.verified_at === undefined ? null : String(row.verified_at),
+    pendingKey: row.pending_pubkey === null || row.pending_pubkey === undefined ? null : bytes(row.pending_pubkey),
+    pendingAt: row.pending_at === null || row.pending_at === undefined ? null : String(row.pending_at),
+  };
+}
+
+/** Read contacts without opening the bridge. The daemon's writes are already committed. */
+export function readContacts(path: string): ContactRecord[] {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 1000');
+    const names = columnSet(db, 'contacts');
+    if (!names.has('handle')) return [];
+    const verified = names.has('verified_at') ? 'verified_at' : 'NULL AS verified_at';
+    const pendingKey = names.has('pending_pubkey') ? 'pending_pubkey' : 'NULL AS pending_pubkey';
+    const pendingAt = names.has('pending_at') ? 'pending_at' : 'NULL AS pending_at';
+    return db
+      .prepare(
+        `SELECT handle, identity_pubkey, ${verified}, ${pendingKey}, ${pendingAt} FROM contacts ORDER BY handle`,
+      )
+      .all()
+      .map(contactRecord);
+  } finally {
+    db.close();
+  }
+}
+
+function applySnapshot(
+  db: StoreDb,
+  topicId: string,
+  seq: number,
+  envelope: Envelope,
+  sealer: SecretSealer | undefined,
+): string | undefined {
   const payload = envelope.payload;
   const doc = payload.doc;
   const version = payload.version;
@@ -406,15 +792,21 @@ function applySnapshot(db: StoreDb, topicId: string, seq: number, envelope: Enve
   if (typeof version !== 'number' || !Number.isInteger(version) || claimed === undefined) return 'state_diverged';
   const actual = hashBytes(doc);
   if (!bytesEqual(actual, claimed)) return 'state_diverged';
-  const current = readState(db, topicId);
+  const current = readState(db, topicId, sealer);
   if (current && current.version === version && bytesEqual(current.hash, actual)) return undefined;
   if (current && current.version === version && !bytesEqual(current.hash, actual)) return 'state_diverged';
   if (current && version < current.version) return undefined;
-  writeState(db, topicId, version, actual, doc, seq);
+  writeState(db, topicId, version, actual, doc, seq, sealer);
   return undefined;
 }
 
-function applyStatePatch(db: StoreDb, topicId: string, seq: number, envelope: Envelope): string | undefined {
+function applyStatePatch(
+  db: StoreDb,
+  topicId: string,
+  seq: number,
+  envelope: Envelope,
+  sealer: SecretSealer | undefined,
+): string | undefined {
   const payload = envelope.payload;
   const baseVersion = payload.base_version;
   const baseHash = typeof payload.base_hash === 'string' ? parseHashLabel(payload.base_hash) : undefined;
@@ -423,7 +815,7 @@ function applyStatePatch(db: StoreDb, topicId: string, seq: number, envelope: En
     markApplied(db, topicId, seq, false);
     return undefined;
   }
-  const current = readState(db, topicId);
+  const current = readState(db, topicId, sealer);
   if (!current || current.version !== baseVersion) {
     markApplied(db, topicId, seq, false);
     return undefined;
@@ -434,7 +826,7 @@ function applyStatePatch(db: StoreDb, topicId: string, seq: number, envelope: En
     markApplied(db, topicId, seq, false);
     return undefined;
   }
-  writeState(db, topicId, current.version + 1, hashBytes(applied.doc), applied.doc, seq);
+  writeState(db, topicId, current.version + 1, hashBytes(applied.doc), applied.doc, seq, sealer);
   markApplied(db, topicId, seq, true);
   return undefined;
 }
@@ -452,57 +844,87 @@ function approvalVerifies(frame: PersistedFrame, envelope: Envelope): boolean {
   return false;
 }
 
-function readState(db: StoreDb, topicId: string): TopicStateRow | undefined {
-  const row = db.prepare('SELECT version, doc_hash, doc_json, updated_seq FROM topic_state WHERE topic_id = ?').get(topicId);
+function readState(db: StoreDb, topicId: string, sealer: SecretSealer | undefined): TopicStateRow | undefined {
+  const row = db
+    .prepare('SELECT version, doc_hash, doc_json, doc_sealed, updated_seq FROM topic_state WHERE topic_id = ?')
+    .get(topicId);
   if (!row) return undefined;
+  const version = Number(row.version);
   return {
-    version: Number(row.version),
+    version,
     hash: bytes(row.doc_hash),
-    doc: JSON.parse(String(row.doc_json)),
+    doc: readDoc(row, topicId, version, sealer),
     updatedSeq: Number(row.updated_seq),
   };
 }
 
-function writeState(db: StoreDb, topicId: string, version: number, hash: Uint8Array, doc: unknown, seq: number): void {
+function writeState(
+  db: StoreDb,
+  topicId: string,
+  version: number,
+  hash: Uint8Array,
+  doc: unknown,
+  seq: number,
+  sealer: SecretSealer | undefined,
+): void {
+  const json = JSON.stringify(doc);
+  const sealed = sealer ? sealer.seal(utf8(json), utf8(stateAad(topicId, version))) : null;
   db.prepare(
-    `INSERT INTO topic_state (topic_id, version, doc_hash, doc_json, updated_seq) VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO topic_state (topic_id, version, doc_hash, doc_json, doc_sealed, updated_seq) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT (topic_id) DO UPDATE SET
        version = excluded.version, doc_hash = excluded.doc_hash,
-       doc_json = excluded.doc_json, updated_seq = excluded.updated_seq`,
-  ).run(topicId, version, hash, JSON.stringify(doc), seq);
+       doc_json = excluded.doc_json, doc_sealed = excluded.doc_sealed, updated_seq = excluded.updated_seq`,
+  ).run(topicId, version, hash, sealed ? '' : json, sealed, seq);
+}
+
+function readDoc(row: Record<string, unknown>, topicId: string, version: number, sealer: SecretSealer | undefined): unknown {
+  if (row.doc_sealed != null) {
+    if (!sealer) throw new BridgeError('mls_error', 'stored state could not be opened', 500);
+    try {
+      return JSON.parse(fromUtf8(sealer.open(bytes(row.doc_sealed), utf8(stateAad(topicId, version)))));
+    } catch (err) {
+      if (err instanceof BridgeError) throw err;
+      throw new BridgeError('mls_error', 'stored state could not be opened', 500);
+    }
+  }
+  if (typeof row.doc_json === 'string' && row.doc_json.length > 0) return JSON.parse(row.doc_json);
+  return {};
+}
+
+export function stateAad(topicId: string, version: number): string {
+  return `topic-state:${topicId}:${version}`;
+}
+
+/** Seal leftover plaintext and rebuild the file before any other connection opens. */
+export function scrubPlaintext(path: string, sealer: SecretSealer): void {
+  if (!existsSync(path)) return;
+  const local = new LocalStore(path, { sealer });
+  try {
+    // Migration vacuums when it rewrites rows. Vacuum again so a file that
+    // only needed secure_delete still drops free pages and the WAL.
+    local.scrubDisk();
+  } finally {
+    local.close();
+  }
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    try {
+      unlinkSync(path + suffix);
+    } catch {
+      // Already removed by the checkpoint.
+    }
+  }
 }
 
 function markApplied(db: StoreDb, topicId: string, seq: number, applied: boolean): void {
   db.prepare('UPDATE envelopes SET applied = ? WHERE topic_id = ? AND seq = ?').run(applied ? 1 : 0, topicId, seq);
 }
 
-function envelopeRow(row: Record<string, unknown>): EnvelopeRow {
-  return {
-    seq: Number(row.seq),
-    messageId: String(row.message_id),
-    authorHandle: String(row.author_handle),
-    authorAgent: row.author_agent === null ? null : String(row.author_agent),
-    type: String(row.type),
-    body: row.body === null ? null : String(row.body),
-    payload: JSON.parse(String(row.payload_json)),
-    approvalOk: Number(row.approval_ok) === 1,
-    applied: row.applied === null ? null : Number(row.applied) === 1,
-    ts: String(row.ts),
-  };
+export function approvalSummaryAad(id: string): string {
+  return `approval:${id}:summary`;
 }
 
-function approvalRow(row: Record<string, unknown>): ApprovalRow {
-  return {
-    approvalId: String(row.approval_id),
-    topicId: String(row.topic_id),
-    kind: String(row.kind),
-    status: String(row.status),
-    requestedBy: String(row.requested_by),
-    summary: String(row.summary),
-    request: JSON.parse(String(row.request_json)),
-    createdAt: String(row.created_at),
-    decidedAt: row.decided_at === null ? null : String(row.decided_at),
-  };
+export function approvalRequestAad(id: string): string {
+  return `approval:${id}:request`;
 }
 
 function parseScope(value: string): '*' | string[] {

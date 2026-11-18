@@ -1,13 +1,20 @@
-// Loopback agent API (REST + MCP) and the minimal human hook on a second port.
-// Agent tokens are rejected on the human port. The passphrase travels in that
-// request body, typed at a TTY by the CLI, never as a flag or environment variable.
+// Loopback agent API (REST + MCP) and the human approval page on a second port.
+// Agent tokens are rejected on the human port. The passphrase is typed into
+// the page or at a TTY by the CLI, never as a flag or environment variable.
+// Browser forms need a CSRF token; JSON from the CLI is not a browser form.
 
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { renderApproval, renderError, renderHome, renderResult, renderTokens } from './approval-page.ts';
+import type { PageApproval } from './approval-page.ts';
 import { BridgeError, toSurfaceError } from './errors.ts';
+import { fingerprintQrPayload } from './fingerprint.ts';
 import type { AgentCaller, Bridge } from './bridge.ts';
 import { dispatch, handleMcp } from './mcp.ts';
+
+const CSRF_COOKIE = 'agb_csrf';
 
 export type ListenerKind = 'agent' | 'human';
 
@@ -21,8 +28,12 @@ export function listen(
   const server = createServer((req, res) => {
     void handle(bridge, kind, req, res).catch((err: unknown) => {
       const error = toSurfaceError(err);
-      if (!res.headersSent) send(res, error.status, error.body());
-      else res.end();
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      if (kind === 'human' && prefersHtml(req)) sendHtml(res, error.status, renderError(error.message));
+      else send(res, error.status, error.body());
     });
   });
   return new Promise((resolve, reject) => {
@@ -82,6 +93,9 @@ async function route(
       ...(url.searchParams.get('status') ? { status: url.searchParams.get('status') } : {}),
     });
   }
+  if (method === 'GET' && parts[0] === 'v1' && parts[1] === 'approvals' && parts.length === 3 && parts[2]) {
+    return bridge.approvalDetail(agent, decodeURIComponent(parts[2]));
+  }
   if (parts[0] !== 'v1' || parts[1] !== 'topics') throw new BridgeError('not_found', 'no such route', 404);
   if (parts.length === 2 && method === 'GET') {
     return dispatch(bridge, agent, 'list_topics', { include_closed: url.searchParams.get('include_closed') === 'true' });
@@ -115,6 +129,57 @@ async function route(
 
 async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const parts = url.pathname.split('/').filter(Boolean);
+  const json = isJson(req);
+  if (req.method === 'GET' && !json && url.pathname !== '/tokens' && url.pathname !== '/tokens/list') {
+    const csrf = newCsrf();
+    if (url.pathname === '/') {
+      sendHtml(res, 200, renderHome(await homeModel(bridge, csrf)), csrf);
+      return;
+    }
+    if (parts[0] === 'approvals' && parts.length === 2 && parts[1]) {
+      const approval = (await bridge.humanApproval(decodeURIComponent(parts[1]))) as unknown as PageApproval;
+      sendHtml(res, 200, renderApproval({ csrf, approval }), csrf);
+      return;
+    }
+  }
+  if (!json && req.method === 'POST') {
+    const form = await formFields(req);
+    assertCsrf(req, form.csrf ?? '');
+    const passphrase = form.passphrase ?? '';
+    if (url.pathname === '/tokens/list') {
+      if (!passphrase) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
+      bridge.provePassphrase(passphrase);
+      sendHtml(res, 200, renderTokens(bridge.listTokens()));
+      return;
+    }
+    if (url.pathname === '/contacts/verify') {
+      const handle = form.handle ?? '';
+      const view = bridge.verifyContact(handle, form.fingerprint ?? '', passphrase);
+      sendHtml(res, 200, renderResult('Contact', verifyMessage(view)));
+      return;
+    }
+    if (parts[0] === 'contacts' && parts[2] === 'verify' && parts[1]) {
+      const view = bridge.verifyContact(decodeURIComponent(parts[1]), form.fingerprint ?? '', passphrase);
+      sendHtml(res, 200, renderResult('Contact', verifyMessage(view)));
+      return;
+    }
+    if (parts[0] === 'approvals' && parts.length === 2 && parts[1]) {
+      if (!passphrase) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
+      const id = decodeURIComponent(parts[1]);
+      if (form.decision === 'deny' || form.decision === 'reject') {
+        await bridge.reject(id, passphrase);
+        sendHtml(res, 200, renderResult('Denied', 'The approval was denied. Nothing was sent.'));
+        return;
+      }
+      if (form.decision === 'approve') {
+        const result = await bridge.approve(id, passphrase);
+        sendHtml(res, 200, renderResult('Approved', `Status: ${result.status}.`));
+        return;
+      }
+      throw new BridgeError('invalid_request', 'decision must be approve or deny');
+    }
+    throw new BridgeError('not_found', 'no such route', 404);
+  }
   if ((req.method === 'GET' || req.method === 'POST') && (url.pathname === '/tokens' && req.method === 'GET' || url.pathname === '/tokens/list')) {
     const body = await jsonBody(req);
     const passphrase = typeof body.passphrase === 'string' ? body.passphrase : undefined;
@@ -127,13 +192,19 @@ async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, 
   const passphrase = typeof body.passphrase === 'string' ? body.passphrase : undefined;
   if (parts[0] === 'approvals' && parts[2] === 'approve' && req.method === 'POST') {
     if (!passphrase || !parts[1]) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
-    send(res, 200, await bridge.approve(parts[1], passphrase));
+    send(res, 200, await bridge.approve(decodeURIComponent(parts[1]), passphrase));
     return;
   }
-  if (parts[0] === 'approvals' && parts[2] === 'reject' && req.method === 'POST') {
+  if (parts[0] === 'approvals' && (parts[2] === 'reject' || parts[2] === 'deny') && req.method === 'POST') {
     if (!passphrase || !parts[1]) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
-    await bridge.reject(parts[1], passphrase);
+    await bridge.reject(decodeURIComponent(parts[1]), passphrase);
     send(res, 200, { status: 'rejected' });
+    return;
+  }
+  if (parts[0] === 'contacts' && parts[2] === 'verify' && req.method === 'POST') {
+    if (!passphrase || !parts[1]) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
+    const fingerprint = typeof body.fingerprint === 'string' ? body.fingerprint : '';
+    send(res, 200, bridge.verifyContact(decodeURIComponent(parts[1]), fingerprint, passphrase));
     return;
   }
   if (parts[0] === 'topics' && parts[2] === 'leave' && req.method === 'POST') {
@@ -163,6 +234,27 @@ async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, 
     return;
   }
   throw new BridgeError('not_found', 'no such route', 404);
+}
+
+function verifyMessage(view: { handle: string; key_changed: boolean }): string {
+  if (view.key_changed) {
+    return `${view.handle} matches the pinned key. The new key is still untrusted until you verify that fingerprint.`;
+  }
+  return `${view.handle} is verified.`;
+}
+
+async function homeModel(bridge: Bridge, csrf: string) {
+  const approvals = (await Promise.all(
+    bridge.humanApprovals('pending').map((item) => bridge.humanApproval(String(item.approval_id))),
+  )) as unknown as PageApproval[];
+  return {
+    csrf,
+    handle: bridge.credential.handle,
+    fingerprint: bridge.fingerprint(),
+    qrPayload: fingerprintQrPayload(bridge.credential.identityKey),
+    approvals,
+    contacts: bridge.listContacts(),
+  };
 }
 
 function authenticate(bridge: Bridge, req: IncomingMessage): AgentCaller {
@@ -205,4 +297,75 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
   res.end(payload);
+}
+
+function sendHtml(res: ServerResponse, status: number, html: string, csrf?: string): void {
+  const headers: Record<string, string | number> = {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': Buffer.byteLength(html),
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; form-action 'self'; base-uri 'none'",
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+  };
+  if (csrf) headers['set-cookie'] = `${CSRF_COOKIE}=${csrf}; HttpOnly; SameSite=Strict; Path=/`;
+  res.writeHead(status, headers);
+  res.end(html);
+}
+
+function prefersHtml(req: IncomingMessage): boolean {
+  const type = contentType(req);
+  if (type.includes('application/json')) return false;
+  return req.method === 'GET' || type.includes('application/x-www-form-urlencoded');
+}
+
+function isJson(req: IncomingMessage): boolean {
+  return contentType(req).includes('application/json');
+}
+
+function contentType(req: IncomingMessage): string {
+  const value = req.headers['content-type'];
+  return typeof value === 'string' ? value.toLowerCase() : '';
+}
+
+function newCsrf(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+function assertCsrf(req: IncomingMessage, formToken: string): void {
+  const fromCookie = readCookie(req, CSRF_COOKIE);
+  if (!fromCookie || !formToken || fromCookie.length !== formToken.length) {
+    throw new BridgeError('unauthorized', 'csrf token is not valid', 403);
+  }
+  const left = Buffer.from(fromCookie);
+  const right = Buffer.from(formToken);
+  if (left.length !== right.length || !timingSafeEqual(left, right)) {
+    throw new BridgeError('unauthorized', 'csrf token is not valid', 403);
+  }
+}
+
+function readCookie(req: IncomingMessage, name: string): string | undefined {
+  const header = req.headers.cookie;
+  if (!header) return undefined;
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return undefined;
+}
+
+async function formFields(req: IncomingMessage): Promise<Record<string, string>> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    size += buf.length;
+    if (size > 65_536) throw new BridgeError('invalid_request', 'form is too large');
+    chunks.push(buf);
+  }
+  const params = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+  const out: Record<string, string> = {};
+  for (const [key, value] of params) out[key] = value;
+  return out;
 }

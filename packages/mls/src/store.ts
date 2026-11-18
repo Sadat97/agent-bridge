@@ -8,7 +8,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLOutputValue } from 'node:sqlite';
-import { bytesEqual, toBase64, utf8 } from '@agent-bridge/protocol';
+import { bytesEqual, fromUtf8, toBase64, utf8 } from '@agent-bridge/protocol';
 import { MlsOperationError } from './errors.ts';
 
 /** AES-256-GCM (or another AEAD) supplied by the bridge. Absent in unit tests. */
@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS pending_outbound (
   message BLOB NOT NULL,
   welcome BLOB,
   mls_state BLOB NOT NULL,
-  manifest_json TEXT NOT NULL
+  manifest_json TEXT NOT NULL DEFAULT '',
+  manifest_sealed BLOB
 );
 CREATE TABLE IF NOT EXISTS key_packages (
   key_package_ref BLOB PRIMARY KEY,
@@ -152,11 +153,14 @@ export class MlsStore {
   constructor(path: string, options?: { sealer?: SecretSealer }) {
     this.#sealer = options?.sealer;
     this.#db = new DatabaseSync(path);
+    this.#db.exec('PRAGMA secure_delete = ON');
     this.#db.prepare('PRAGMA journal_mode = WAL').get();
     this.#db.exec('PRAGMA synchronous = FULL');
     this.#db.exec('PRAGMA busy_timeout = 1000');
     this.#db.exec(SCHEMA);
     this.#ensureRatchetColumns();
+    this.#ensurePendingManifestColumn();
+    this.#migratePendingManifests();
     for (const row of this.#db.prepare('SELECT handle, identity_pubkey FROM contacts').all()) {
       this.pins.set(text(row.handle, 'handle'), blob(row.identity_pubkey, 'identity_pubkey'));
     }
@@ -271,24 +275,36 @@ export class MlsStore {
 
   pending(topicId: string): PendingRow | undefined {
     const row = this.#db
-      .prepare('SELECT message, welcome, mls_state, manifest_json FROM pending_outbound WHERE topic_id = ?')
+      .prepare('SELECT message, welcome, mls_state, manifest_json, manifest_sealed FROM pending_outbound WHERE topic_id = ?')
       .get(topicId);
     if (!row) return undefined;
     return {
       message: blob(row.message, 'message'),
       welcome: row.welcome === null ? null : blob(row.welcome, 'welcome'),
       mlsState: this.#open(blob(row.mls_state, 'mls_state'), `pending-mls:${topicId}`),
-      manifestJson: text(row.manifest_json, 'manifest_json'),
+      manifestJson: this.#manifestJson(topicId, row.manifest_json, row.manifest_sealed),
     };
   }
 
   stagePending(topicId: string, row: PendingRow): void {
+    const stored = this.#storeManifest(topicId, row.manifestJson);
     this.transaction(() => {
       const existing = this.#db.prepare('SELECT 1 AS hit FROM pending_outbound WHERE topic_id = ?').get(topicId);
       if (existing) throw new MlsOperationError('outbound_pending', 'an outbound message is already staged');
       this.#db
-        .prepare('INSERT INTO pending_outbound (topic_id, message, welcome, mls_state, manifest_json) VALUES (?, ?, ?, ?, ?)')
-        .run(topicId, row.message, row.welcome, this.#seal(row.mlsState, `pending-mls:${topicId}`), row.manifestJson);
+        .prepare(
+          `INSERT INTO pending_outbound (
+             topic_id, message, welcome, mls_state, manifest_json, manifest_sealed
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          topicId,
+          row.message,
+          row.welcome,
+          this.#seal(row.mlsState, `pending-mls:${topicId}`),
+          stored.json,
+          stored.sealed,
+        );
     });
   }
 
@@ -441,6 +457,48 @@ export class MlsStore {
     }
   }
 
+  #ensurePendingManifestColumn(): void {
+    const names = new Set(
+      this.#db
+        .prepare('PRAGMA table_info(pending_outbound)')
+        .all()
+        .map((row) => text(row.name, 'name')),
+    );
+    if (names.size > 0 && !names.has('manifest_sealed')) {
+      this.#db.exec('ALTER TABLE pending_outbound ADD COLUMN manifest_sealed BLOB');
+    }
+  }
+
+  /** A staged send that never reached the relay still holds the envelope. Seal it. */
+  #migratePendingManifests(): void {
+    if (!this.#sealer) return;
+    const rows = this.#db
+      .prepare('SELECT topic_id, manifest_json, manifest_sealed FROM pending_outbound')
+      .all();
+    const update = this.#db.prepare(
+      'UPDATE pending_outbound SET manifest_json = \'\', manifest_sealed = ? WHERE topic_id = ?',
+    );
+    this.transaction(() => {
+      for (const row of rows) {
+        if (row.manifest_sealed != null) continue;
+        const json = text(row.manifest_json, 'manifest_json');
+        if (json === '') continue;
+        const topicId = text(row.topic_id, 'topic_id');
+        update.run(this.#seal(utf8(json), pendingManifestAad(topicId)), topicId);
+      }
+    });
+  }
+
+  #storeManifest(topicId: string, manifestJson: string): { json: string; sealed: Uint8Array | null } {
+    if (!this.#sealer) return { json: manifestJson, sealed: null };
+    return { json: '', sealed: this.#seal(utf8(manifestJson), pendingManifestAad(topicId)) };
+  }
+
+  #manifestJson(topicId: string, json: SQLOutputValue | undefined, sealed: SQLOutputValue | undefined): string {
+    if (sealed != null) return fromUtf8(this.#open(blob(sealed, 'manifest_sealed'), pendingManifestAad(topicId)));
+    return text(json, 'manifest_json');
+  }
+
   #seal(plain: Uint8Array, aad: string): Uint8Array {
     return this.#sealer ? this.#sealer.seal(plain, utf8(aad)) : plain;
   }
@@ -455,6 +513,32 @@ export class MlsStore {
     }
   }
 
+  /** First sight of a handle, or the same key again. A different key throws and is not stored. */
+  pinIdentity(pin: IdentityPin): void {
+    let added = false;
+    this.transaction(() => {
+      added = this.#insertPin(pin);
+    });
+    if (added) this.pins.set(pin.handle, pin.identityKey.slice());
+  }
+
+  /**
+   * Replace a pin after the person verified the new fingerprint out of band.
+   * This is the only write that changes a pinned key. MLS processing must
+   * keep using `#insertPin`, which refuses a silent change.
+   */
+  rePin(handle: string, identityKey: Uint8Array): void {
+    this.transaction(() => {
+      const existing = this.#db.prepare('SELECT handle FROM contacts WHERE handle = ?').get(handle);
+      if (!existing) {
+        this.#db.prepare('INSERT INTO contacts (handle, identity_pubkey) VALUES (?, ?)').run(handle, identityKey);
+      } else {
+        this.#db.prepare('UPDATE contacts SET identity_pubkey = ? WHERE handle = ?').run(identityKey, handle);
+      }
+    });
+    this.pins.set(handle, identityKey.slice());
+  }
+
   /** Insert a pin or accept the same key. Throws, without writing, when the key differs. */
   #insertPin(pin: IdentityPin): boolean {
     const existing = this.#db.prepare('SELECT identity_pubkey FROM contacts WHERE handle = ?').get(pin.handle);
@@ -467,6 +551,10 @@ export class MlsStore {
     this.#db.prepare('INSERT INTO contacts (handle, identity_pubkey) VALUES (?, ?)').run(pin.handle, pin.identityKey);
     return true;
   }
+}
+
+export function pendingManifestAad(topicId: string): string {
+  return `pending-outbound:${topicId}:manifest`;
 }
 
 function epochNumber(epoch: bigint): number {

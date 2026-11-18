@@ -5,7 +5,7 @@ export type { CommitDecision, CommitPolicyContext, RecordedMessage } from './com
 export { encodeEnvelope, parseEnvelope, MESSAGE_TYPES } from './envelope.ts';
 export type { Envelope, MessageType } from './envelope.ts';
 export { readKeyPackage } from './key-package.ts';
-export { MlsStore } from './store.ts';
+export { MlsStore, pendingManifestAad } from './store.ts';
 export type { IdentityPin, SecretSealer, StoreDb, StoredMessage, TopicRole, TopicStatus } from './store.ts';
 export { replenishKeyPackages, TopicSession } from './session.ts';
 export type {
