@@ -1,8 +1,10 @@
-// Human group view. Plain language only: no passphrase field, no composer,
-// and no epochs, hashes, tool names, or protocol paths. Yes / No / Edit post
-// to the approval route; http.ts still requires the identity passphrase before
-// anything is sent. renderExtensionCard is the hook for a future item card
-// (an open question, a vote). This view does not invent those types.
+// Human group view. Plain language only: no passphrase field and no composer.
+// Chat text is shown in full. Snapshots, patches, proposals, and system
+// events are omitted by type, not by scanning the words in a chat.
+// Yes / No / Edit post to the approval route; http.ts still requires the
+// identity passphrase before anything is sent. renderExtensionCard is the
+// hook for a future item card (an open question, a vote). This view does not
+// invent those types.
 
 /** Read cursor for the person. Not an agent label, so opening a group does not move an agent's cursor. */
 export const HUMAN_READ_LABEL = 'human:';
@@ -284,10 +286,10 @@ function approvalCard(topicId: string, approval: GroupApproval, csrf: string): s
 function cardCopy(approval: GroupApproval): { title: string; draft: string; note?: string; canEdit: boolean } {
   const request = isRecord(approval.request) ? approval.request : {};
   if (approval.kind === 'request') {
-    const body = typeof request.body === 'string' && request.body.trim() ? request.body.trim() : approval.summary;
+    const body = typeof request.body === 'string' ? request.body.trim() : '';
     return {
       title: 'Your agent wants to send this',
-      draft: isNoiseText(body) ? approval.summary : body,
+      draft: body || approval.summary.trim(),
       note: plainConsequence(request),
       canEdit: true,
     };
@@ -295,7 +297,7 @@ function cardCopy(approval: GroupApproval): { title: string; draft: string; note
   if (approval.kind === 'state_change') {
     return {
       title: 'Your agent wants to update the shared notes',
-      draft: isNoiseText(approval.summary) ? '' : approval.summary,
+      draft: approval.summary.trim(),
       note: 'This changes something you asked to confirm.',
       canEdit: false,
     };
@@ -311,7 +313,7 @@ function cardCopy(approval: GroupApproval): { title: string; draft: string; note
   if (approval.kind === 'join') {
     return {
       title: 'You were added to this group',
-      draft: isNoiseText(approval.summary) ? '' : approval.summary,
+      draft: approval.summary.trim(),
       canEdit: false,
     };
   }
@@ -324,14 +326,13 @@ function plainConsequence(request: Record<string, unknown>): string | undefined 
   if (kind === 'spend') {
     const amount = payload.amount;
     if (typeof amount === 'number' && Number.isFinite(amount)) return `This spends ${amount}.`;
-    if (typeof amount === 'string' && amount.trim() && !isNoiseText(amount) && amount.length < 40) {
-      return `This spends ${amount.trim()}.`;
-    }
+    const amountText = typeof amount === 'string' ? amount.trim() : '';
+    if (amountText && amountText.length < 40) return `This spends ${amountText}.`;
     return 'This spends money.';
   }
   if (kind === 'external_message') {
     const to = typeof payload.to === 'string' ? payload.to.trim() : '';
-    if (to && !isNoiseText(to) && to.length < 80) return `This contacts someone outside the group: ${to}.`;
+    if (to && to.length < 80) return `This contacts someone outside the group: ${to}.`;
     return 'This contacts someone outside the group.';
   }
   return undefined;
@@ -389,7 +390,9 @@ function visibleChats(record: GroupRecord): GroupEnvelope[] {
 function chatText(row: GroupEnvelope): string | undefined {
   if (!CHAT_TYPES.has(row.type)) return undefined;
   const body = row.body?.trim() ?? '';
-  if (!body || isNoiseText(body)) return undefined;
+  // The words inside a chat are the message. A tool name or a path in the
+  // sentence does not make it protocol noise; only the envelope type does.
+  if (!body) return undefined;
   return body;
 }
 
@@ -405,34 +408,6 @@ const HIDDEN_TYPES = new Set([
 
 function hiddenType(type: string): boolean {
   return HIDDEN_TYPES.has(type);
-}
-
-const TOOL_NAMES = [
-  'list_topics',
-  'create_topic',
-  'list_members',
-  'invite_member',
-  'remove_member',
-  'read_messages',
-  'post_message',
-  'get_state',
-  'propose_state_change',
-  'list_approvals',
-  'self_update',
-  'self-update',
-];
-
-export function isNoiseText(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed) return true;
-  const lower = trimmed.toLowerCase();
-  if (lower === 'discarded draft' || lower === 'state snapshot' || lower === 'state updated') return true;
-  if (/sha256:[0-9a-f]/i.test(trimmed)) return true;
-  if (/\bepoch\b/i.test(trimmed)) return true;
-  if (/\/_meta(\/|$)/.test(trimmed)) return true;
-  if (/(^|\s)\/[a-z0-9_*]+(?:\/[a-z0-9_*]+)+/i.test(trimmed)) return true;
-  if (TOOL_NAMES.some((name) => lower.includes(name))) return true;
-  return false;
 }
 
 function keyLine(handle: string): string {
@@ -497,9 +472,11 @@ function renderValue(value: unknown, depth: number): { value: string; note?: str
   return { value: parts.join(', ') || note || '', ...(parts.length > 0 && note ? { note } : {}) };
 }
 
+/** A shared-state value that is itself a hash or a path. A sentence that mentions one is kept. */
 function looksTechnical(text: string): boolean {
-  if (isNoiseText(text)) return true;
+  if (/^sha256:[0-9a-f]+$/i.test(text)) return true;
   if (/^[0-9a-f]{32,}$/i.test(text)) return true;
+  if (/^\/[A-Za-z0-9_*]+(?:\/[A-Za-z0-9_*]+)+$/.test(text)) return true;
   if (text.length > 180) return true;
   return false;
 }

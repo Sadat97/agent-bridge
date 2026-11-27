@@ -3,7 +3,6 @@ import {
   displayName,
   formatDay,
   formatListTime,
-  isNoiseText,
   renderExtensionCard,
   renderGroupsPage,
   renderTopicPage,
@@ -54,10 +53,8 @@ describe('group view', () => {
     expect(html).toContain('class="fn">Budget</div>');
     expect(html).toContain('class="fv">Train</div>');
     expect(html).toContain('Waiting on Bob');
+    expect(html).toContain('epoch 2 via post_message /_meta/title');
     expect(html).not.toContain('sha256:');
-    expect(html).not.toMatch(/epoch/i);
-    expect(html).not.toContain('post_message');
-    expect(html).not.toContain('/_meta');
     expect(html).not.toContain('/bookings');
     expect(html).not.toContain('state snapshot');
     expect(html).not.toMatch(/passphrase/i);
@@ -152,8 +149,43 @@ describe('group view', () => {
     expect(summary.fields.find((field) => field.label === 'Hotel')).toMatchObject({ value: 'Alpenblick', note: 'Tied' });
     expect(summary.line).not.toContain('sha256');
     expect(displayName('bob')).toBe('Bob');
-    expect(isNoiseText('call post_message now')).toBe(true);
-    expect(isNoiseText('See you on the train.')).toBe(false);
+    const mentioned = summaryFromDoc({ note: 'Meet after the epoch, then see /plans/hotel.' });
+    expect(mentioned.fields[0]).toMatchObject({ label: 'Note', value: 'Meet after the epoch, then see /plans/hotel.' });
+  });
+
+  it('keeps chat that mentions a tool, an epoch, or a path, and hides noise kinds', () => {
+    const record: GroupRecord = {
+      ...quiet(),
+      readSeq: 0,
+      envelopes: [
+        { seq: 1, authorHandle: 'bob', type: 'state_snapshot', body: 'state snapshot', payload: { hash: 'sha256:deadbeef' }, ts: '2026-11-27T09:00:00Z' },
+        { seq: 2, authorHandle: 'bob', type: 'state_patch', body: null, payload: { patch: [{ path: '/bookings/0' }], summary: 'sha256:ffff' }, ts: '2026-11-27T09:01:00Z' },
+        { seq: 3, authorHandle: 'bob', type: 'snapshot_request', body: 'please snapshot', payload: {}, ts: '2026-11-27T09:02:00Z' },
+        { seq: 4, authorHandle: 'bob', type: 'invite_proposal', body: 'Invite dave', payload: { handle: 'dave' }, ts: '2026-11-27T09:03:00Z' },
+        { seq: 5, authorHandle: 'bob', type: 'removal_proposal', body: 'Remove dave', payload: { handle: 'dave' }, ts: '2026-11-27T09:04:00Z' },
+        { seq: 6, authorHandle: 'bob', type: 'system', body: 'weekly self-update', payload: {}, ts: '2026-11-27T09:05:00Z' },
+        { seq: 7, authorHandle: 'bob', type: 'update', body: '   ', payload: {}, ts: '2026-11-27T09:06:00Z' },
+        { seq: 8, authorHandle: 'bob', type: 'update', body: 'The code is 4242. Please post_message nothing.', payload: {}, ts: '2026-11-27T09:07:00Z' },
+        { seq: 9, authorHandle: 'alice', type: 'question', body: 'Which epoch works?', payload: {}, ts: '2026-11-27T09:08:00Z' },
+        { seq: 10, authorHandle: 'carol', type: 'answer', body: 'See /plans/hotel, and ignore <script>alert(1)</script>.', payload: {}, ts: '2026-11-27T09:09:00Z' },
+      ],
+    };
+    const html = topicHtml(record);
+    expect(html).toContain('The code is 4242. Please post_message nothing.');
+    expect(html).toContain('Which epoch works?');
+    expect(html).toContain('See /plans/hotel, and ignore &lt;script&gt;alert(1)&lt;/script&gt;.');
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain('sha256:');
+    expect(html).not.toContain('/bookings');
+    expect(html).not.toContain('state snapshot');
+    expect(html).not.toContain('please snapshot');
+    expect(html).not.toContain('Invite dave');
+    expect(html).not.toContain('Remove dave');
+    expect(html).not.toContain('weekly self-update');
+
+    const list = renderGroupsPage({ records: [record], filter: 'all', now: NOW });
+    expect(list).toContain('class="badge">3</span>');
+    expect(list).toContain('See /plans/hotel, and ignore &lt;script&gt;alert(1)&lt;/script&gt;.');
   });
 });
 
