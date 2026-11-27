@@ -72,13 +72,14 @@ export function renderHome(opts: {
     'Approvals',
     `${alerts}
      <p class="muted">This page is only on your computer. Approving or denying requires your identity passphrase. Agents cannot do it.</p>
+     <p><a href="/groups">Groups</a></p>
      <h2>Your safety number</h2>
      <p class="fp">${esc(opts.fingerprint)}</p>
      ${qrSvg(opts.qrPayload)}
      <p class="muted">${esc(opts.handle)}</p>
      <h2>Pending</h2>
      ${rows ? `<ul>${rows}</ul>` : '<p class="muted">Nothing is waiting.</p>'}
-     <h2>Contacts</h2>
+     <h2 id="contacts">Contacts</h2>
      ${contacts || '<p class="muted">No contacts pinned yet.</p>'}
      <h2>Verify a fingerprint</h2>
      <form method="post" action="/contacts/verify">
@@ -98,8 +99,11 @@ export function renderHome(opts: {
   );
 }
 
-export function renderApproval(opts: { csrf: string; approval: PageApproval }): string {
+export function renderApproval(opts: { csrf: string; approval: PageApproval; draft?: string }): string {
   const item = opts.approval;
+  const draft = opts.draft?.trim();
+  const request =
+    draft && item.kind === 'request' && isPlainRecord(item.request) ? { ...item.request, body: draft } : item.request;
   const contact = item.contact;
   const warn =
     contact?.key_changed
@@ -130,14 +134,42 @@ export function renderApproval(opts: { csrf: string; approval: PageApproval }): 
        ${item.topic_title ? `<p>Topic: ${esc(item.topic_title)}</p>` : ''}
        ${hold}
        ${paths}
-       <pre>${esc(JSON.stringify(item.request ?? {}, null, 2))}</pre>
+       <pre>${esc(JSON.stringify(request ?? {}, null, 2))}</pre>
      </div>
      ${contactBlock}
      <form method="post" action="/approvals/${esc(item.approval_id)}">
        ${csrfField(opts.csrf)}
+       ${draft && item.kind === 'request' ? `<input type="hidden" name="body" value="${esc(draft)}">` : ''}
        <label>Identity passphrase <input type="password" name="passphrase" autocomplete="off" required></label>
        <button type="submit" name="decision" value="approve">Approve</button>
        <button type="submit" name="decision" value="deny">Deny</button>
+     </form>`,
+  );
+}
+
+export function renderVerify(opts: { csrf: string; contact: ContactView }): string {
+  const contact = opts.contact;
+  const changed = contact.key_changed
+    ? `<div class="banner"><strong>Key changed for ${esc(contact.handle)}.</strong> Compare the new safety number out of band. Pinned <span class="fp">${esc(contact.fingerprint)}</span>. New <span class="fp">${esc(contact.pending_fingerprint ?? '')}</span>.</div>`
+    : '';
+  const pendingQr =
+    contact.key_changed && contact.pending_qr_payload
+      ? `<p>New safety number</p><p class="fp">${esc(contact.pending_fingerprint ?? '')}</p>${qrSvg(contact.pending_qr_payload)}`
+      : '';
+  return layout(
+    'Check',
+    `${changed}
+     <p><a href="/groups">Groups</a></p>
+     <p>Check this safety number with ${esc(contact.handle)} out of band, then enter what they showed you.</p>
+     <p class="fp">${esc(contact.fingerprint)}</p>
+     ${qrSvg(contact.qr_payload)}
+     ${pendingQr}
+     <form method="post" action="/contacts/verify">
+       ${csrfField(opts.csrf)}
+       <input type="hidden" name="handle" value="${esc(contact.handle)}">
+       <label>Safety number or QR payload <input type="text" name="fingerprint" autocomplete="off" required></label>
+       <label>Identity passphrase <input type="password" name="passphrase" autocomplete="off" required></label>
+       <button type="submit">Verify</button>
      </form>`,
   );
 }
@@ -152,8 +184,9 @@ export function renderTokens(tokens: Array<{ agent_label: string; topic_scope: u
   return layout('Agent tokens', `<p><a href="/">Approvals</a></p><ul>${rows}</ul>`);
 }
 
-export function renderResult(title: string, body: string): string {
-  return layout(title, `<p>${esc(body)}</p><p><a href="/">Back to approvals</a></p>`);
+export function renderResult(title: string, body: string, next?: { href: string; label: string }): string {
+  const extra = next ? `<p><a href="${esc(next.href)}">${esc(next.label)}</a></p>` : '';
+  return layout(title, `<p>${esc(body)}</p><p><a href="/">Back to approvals</a></p>${extra}`);
 }
 
 export function renderError(message: string): string {
@@ -186,6 +219,10 @@ function labelHold(hold: string): string {
   if (hold === 'external_message') return 'external message';
   if (hold === 'sensitive_path') return 'sensitive path';
   return hold;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function esc(value: string): string {

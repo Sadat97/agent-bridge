@@ -7,8 +7,10 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { renderApproval, renderError, renderHome, renderResult, renderTokens } from './approval-page.ts';
+import { renderApproval, renderError, renderHome, renderResult, renderTokens, renderVerify } from './approval-page.ts';
 import type { PageApproval } from './approval-page.ts';
+import { renderGroupsPage, renderTopicPage } from './group-view.ts';
+import type { GroupFilter } from './group-view.ts';
 import { BridgeError, toSurfaceError } from './errors.ts';
 import { fingerprintQrPayload } from './fingerprint.ts';
 import type { AgentCaller, Bridge } from './bridge.ts';
@@ -130,6 +132,10 @@ async function route(
 async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const parts = url.pathname.split('/').filter(Boolean);
   const json = isJson(req);
+  if (req.method === 'GET' && !json && (url.pathname === '/groups' || parts[0] === 'groups' || (parts[0] === 'contacts' && parts[2] === 'verify'))) {
+    await humanPage(bridge, res, url, parts);
+    return;
+  }
   if (req.method === 'GET' && !json && url.pathname !== '/tokens' && url.pathname !== '/tokens/list') {
     const csrf = newCsrf();
     if (url.pathname === '/') {
@@ -145,6 +151,10 @@ async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, 
   if (!json && req.method === 'POST') {
     const form = await formFields(req);
     assertCsrf(req, form.csrf ?? '');
+    if (parts[0] === 'groups' && parts[2] === 'approvals' && parts.length === 4 && parts[1] && parts[3]) {
+      await decideGroup(bridge, res, decodeURIComponent(parts[1]), decodeURIComponent(parts[3]), form);
+      return;
+    }
     const passphrase = form.passphrase ?? '';
     if (url.pathname === '/tokens/list') {
       if (!passphrase) throw new BridgeError('invalid_passphrase', 'passphrase is required', 401);
@@ -172,6 +182,15 @@ async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, 
         return;
       }
       if (form.decision === 'approve') {
+        const draft = (form.body ?? '').trim();
+        if (draft) {
+          // Prove the passphrase before rewriting the draft, so a wrong one changes nothing.
+          bridge.provePassphrase(passphrase);
+          const pending = await bridge.humanApproval(id);
+          if (pending.kind === 'request' && typeof pending.topic_id === 'string') {
+            bridge.revisePendingText(pending.topic_id, id, draft);
+          }
+        }
         const result = await bridge.approve(id, passphrase);
         sendHtml(res, 200, renderResult('Approved', `Status: ${result.status}.`));
         return;
@@ -234,6 +253,69 @@ async function human(bridge: Bridge, req: IncomingMessage, res: ServerResponse, 
     return;
   }
   throw new BridgeError('not_found', 'no such route', 404);
+}
+
+async function humanPage(bridge: Bridge, res: ServerResponse, url: URL, parts: string[]): Promise<void> {
+  const csrf = newCsrf();
+  const now = new Date();
+  const filter: GroupFilter = url.searchParams.get('filter') === 'needs' ? 'needs' : 'all';
+  if (parts[0] === 'contacts' && parts[2] === 'verify' && parts[1]) {
+    const contact = bridge.contact(decodeURIComponent(parts[1]));
+    if (!contact) throw new BridgeError('not_found', 'no such contact', 404);
+    sendHtml(res, 200, renderVerify({ csrf, contact }), csrf);
+    return;
+  }
+  if (url.pathname === '/groups') {
+    sendHtml(res, 200, renderGroupsPage({ records: bridge.humanGroupRecords(), filter, now }), csrf);
+    return;
+  }
+  if (parts[0] === 'groups' && parts.length === 2 && parts[1]) {
+    const topicId = decodeURIComponent(parts[1]);
+    const html = renderTopicPage({ records: bridge.humanGroupRecords(topicId), topicId, filter, now, csrf });
+    if (!html) throw new BridgeError('not_found', 'no such topic', 404);
+    sendHtml(res, 200, html, csrf);
+    return;
+  }
+  throw new BridgeError('not_found', 'no such route', 404);
+}
+
+async function decideGroup(
+  bridge: Bridge,
+  res: ServerResponse,
+  topicId: string,
+  approvalId: string,
+  form: Record<string, string>,
+): Promise<void> {
+  const detail = await bridge.humanApproval(approvalId);
+  if (detail.topic_id !== topicId) throw new BridgeError('not_found', 'no such approval', 404);
+  const decision = form.decision ?? '';
+  if (decision !== 'approve' && decision !== 'deny' && decision !== 'reject' && decision !== 'edit') {
+    throw new BridgeError('invalid_request', 'decision must be approve or deny');
+  }
+  const text = (form.body ?? '').trim();
+  const edits = decision === 'edit' || (decision === 'approve' && text.length > 0 && detail.kind === 'request');
+  const passphrase = form.passphrase ?? '';
+  const back = { href: `/groups/${encodeURIComponent(topicId)}`, label: 'Back to the group' };
+  if (!passphrase) {
+    // Keep the new wording on the confirm form only. It is stored when the
+    // passphrase check succeeds, so a loopback client cannot rewrite a draft.
+    if (edits && !text) throw new BridgeError('invalid_request', 'message text is empty');
+    const approval = (await bridge.humanApproval(approvalId)) as unknown as PageApproval;
+    const csrf = newCsrf();
+    sendHtml(res, 200, renderApproval({ csrf, approval, ...(edits ? { draft: text } : {}) }), csrf);
+    return;
+  }
+  if (edits) {
+    bridge.provePassphrase(passphrase);
+    bridge.revisePendingText(topicId, approvalId, text);
+  }
+  if (decision === 'deny' || decision === 'reject') {
+    await bridge.reject(approvalId, passphrase);
+    sendHtml(res, 200, renderResult('Denied', 'The approval was denied. Nothing was sent.', back));
+    return;
+  }
+  const result = await bridge.approve(approvalId, passphrase);
+  sendHtml(res, 200, renderResult('Approved', `Status: ${result.status}.`, back));
 }
 
 function verifyMessage(view: { handle: string; key_changed: boolean }): string {
