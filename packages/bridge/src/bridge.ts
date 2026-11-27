@@ -30,6 +30,8 @@ import { BridgeError, toSurfaceError } from './errors.ts';
 import { fingerprint, fingerprintDigits, fingerprintQrPayload, parseFingerprint } from './fingerprint.ts';
 import { applyPatch, hashBytes, hashLabel, pointerValue } from './json.ts';
 import type { PatchOp } from './json.ts';
+import { HUMAN_READ_LABEL } from './group-view.ts';
+import type { GroupApproval, GroupEnvelope, GroupKeyChange, GroupMember, GroupRecord } from './group-view.ts';
 import { LocalStore, scrubPlaintext } from './local.ts';
 import type { ApprovalRow, EnvelopeRow } from './local.ts';
 import { DEFAULT_POLICY, loadPolicy, patchNeedsApproval, pathIsSensitive, requestNeedsApproval } from './policy.ts';
@@ -822,6 +824,64 @@ export class Bridge {
     return this.local.approvals('*', status).map((row) => approvalView(row));
   }
 
+  /**
+   * Topics the person can read on the group page. Opening one advances the
+   * person's cursor only — agent cursors stay where they are.
+   */
+  humanGroupRecords(openTopicId?: string): GroupRecord[] {
+    if (openTopicId !== undefined) {
+      const session = this.#sessions.get(openTopicId);
+      if (!session || session.status === 'left') throw new BridgeError('not_found', 'no such topic', 404);
+      const max = this.local.topicEnvelopes(openTopicId).reduce((seq, row) => Math.max(seq, row.seq), 0);
+      if (max > 0) this.local.advanceCursor(HUMAN_READ_LABEL, openTopicId, max);
+    }
+    const records: GroupRecord[] = [];
+    for (const [topicId, session] of this.#sessions) {
+      if (session.status === 'left') continue;
+      const state = this.local.state(topicId);
+      const meta = metaOf(state?.doc);
+      const members = this.local.members(topicId).filter((member) => member.removedAt === null);
+      const keyChanged: GroupKeyChange[] = [];
+      for (const member of members) {
+        if (member.handle === this.credential.handle) continue;
+        const contact = this.local.contact(member.handle);
+        if (contact?.pendingKey) keyChanged.push({ handle: member.handle, at: contact.pendingAt });
+      }
+      const pending = this.local.approvals([topicId], 'pending');
+      records.push({
+        topicId,
+        title: meta.title || meta.slug || 'Group',
+        status: session.status,
+        selfHandle: this.credential.handle,
+        doc: state?.doc ?? {},
+        envelopes: this.local.topicEnvelopes(topicId).map(groupEnvelope),
+        pending: pending.map(groupApproval),
+        members: members.map(groupMember),
+        keyChanged,
+        readSeq: this.local.cursor(HUMAN_READ_LABEL, topicId),
+      });
+    }
+    return records;
+  }
+
+  /**
+   * Replace the text of a pending outbound message. Does not sign or send.
+   * The request payload (spend, external contact, and the rest) is unchanged.
+   */
+  revisePendingText(topicId: string, approvalId: string, body: string): void {
+    const row = this.local.approval(approvalId);
+    if (!row || row.topicId !== topicId) throw new BridgeError('not_found', 'no such approval', 404);
+    if (row.status !== 'pending') throw new BridgeError('invalid_request', 'approval is not pending');
+    if (row.kind !== 'request') throw new BridgeError('invalid_request', 'only the message text can be edited');
+    const text = body.trim();
+    if (!text) throw new BridgeError('invalid_request', 'message text is empty');
+    if (text.length > 4000) throw new BridgeError('invalid_request', 'message text is too long');
+    const request = isRecord(row.request) ? { ...row.request, body: text } : { body: text };
+    if (!this.local.revisePendingRequest(approvalId, text.slice(0, 200), request)) {
+      throw new BridgeError('invalid_request', 'approval is not pending');
+    }
+  }
+
   async #publishPatch(
     session: Session,
     agentLabel: string | undefined,
@@ -1610,6 +1670,31 @@ function messageView(
     reply_to: null,
     approval: row.approvalOk ? 'signed' : 'none',
   };
+}
+
+function groupEnvelope(row: EnvelopeRow): GroupEnvelope {
+  return {
+    seq: row.seq,
+    authorHandle: row.authorHandle,
+    type: row.type,
+    body: row.body,
+    payload: row.payload,
+    ts: row.ts,
+  };
+}
+
+function groupApproval(row: ApprovalRow): GroupApproval {
+  return {
+    approvalId: row.approvalId,
+    kind: row.kind,
+    summary: row.summary,
+    request: row.request,
+    createdAt: row.createdAt,
+  };
+}
+
+function groupMember(member: { handle: string; role: string }): GroupMember {
+  return { handle: member.handle, role: member.role };
 }
 
 function approvalView(row: ApprovalRow): Record<string, unknown> {

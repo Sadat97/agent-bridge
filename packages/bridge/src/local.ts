@@ -300,6 +300,18 @@ export class LocalStore {
       .map((row) => this.#envelopeRow(row));
   }
 
+  /** Every decrypted envelope in relay order. The human page filters this; it does not read sealed columns. */
+  topicEnvelopes(topicId: string): EnvelopeRow[] {
+    return this.db
+      .prepare(
+        `SELECT topic_id, seq, message_id, author_handle, author_agent, type, body, payload_json,
+                approval_ok, applied, ts, body_sealed, payload_sealed
+           FROM envelopes WHERE topic_id = ? ORDER BY seq`,
+      )
+      .all(topicId)
+      .map((row) => this.#envelopeRow(row));
+  }
+
   cursor(label: string, topicId: string): number {
     const row = this.db
       .prepare('SELECT last_read_seq FROM read_cursors WHERE agent_label = ? AND topic_id = ?')
@@ -385,6 +397,19 @@ export class LocalStore {
     this.db
       .prepare('UPDATE approvals SET request_json = \'\', request_sealed = ? WHERE approval_id = ?')
       .run(this.#sealText(json, approvalRequestAad(id)), id);
+  }
+
+  /** Rewrite a still-pending approval's summary and request. Returns false if it is no longer pending. */
+  revisePendingRequest(id: string, summary: string, request: unknown): boolean {
+    const sealed = this.#sealApproval(id, summary, JSON.stringify(request));
+    const result = this.db
+      .prepare(
+        `UPDATE approvals
+            SET summary = ?, request_json = ?, summary_sealed = ?, request_sealed = ?
+          WHERE approval_id = ? AND status = 'pending'`,
+      )
+      .run(sealed.summary, sealed.requestJson, sealed.summarySealed, sealed.requestSealed, id);
+    return result.changes === 1;
   }
 
   decideApproval(id: string, status: 'approved' | 'rejected' | 'done' | 'expired'): void {

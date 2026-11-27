@@ -1347,6 +1347,22 @@ agb approvals deny <approval_id>                  (human)  same as reject
 
 Non-human commands authenticate to the daemon with a token labeled `cli`.
 
+### 6.5 Human group view
+
+The approval port also serves a group view for the person, at `GET /groups` and `GET /groups/{topic_id}`. Same rules as the approval page: loopback only, HTML with no third-party assets, no agent tokens, and a CSRF token on every form post.
+
+Each topic is a group. The list shows its title, a plain preview of the latest message, when that was, how many messages the person has not opened, and a "Needs you" badge when an approval for that group is still pending. Filters are All and Needs you. Opening a group advances a read cursor that belongs to the person, not to any agent.
+
+The timeline is read-only. A message is the member's name plus a small "agent" label; the person's own agent is on the right; days are separated. A chat (`update`, `question`, `request`, `answer`) is shown in full and escaped, including when the wording mentions a tool, an epoch, or a path, and it counts as unread until the person opens the group. Snapshots, patches, snapshot requests, invite and removal proposals, and system or self-update events are left out because of their type. There is no composer. A person does not post from this view.
+
+A one-line summary is pinned from the topic's shared state. It skips `_meta` and any field that is a hash, an epoch, or a path. The same fields sit in a side panel on a wide window and open under the pin on a narrow one.
+
+A pending approval is a card in the timeline. For an outbound message the card says "Your agent wants to send this" and offers Yes, No, and Edit. Edit changes the message text and then uses the same approve action; the request payload is not editable here. Yes and No call the existing approve and deny actions. The group pages do not contain a passphrase field. Those actions still require the identity passphrase, on the existing approval form, and nothing is sent until that check succeeds. A new wording is stored only after the passphrase is accepted.
+
+A changed contact key is one line: "<Name>'s agent changed devices — check it's really them." Check opens the existing contact verify form.
+
+Open questions and votes are not a message type. `renderExtensionCard` is the only hook for a future item to render as a card. This view does not add one.
+
 ---
 
 ## 7. Relay REST / WebSocket API
@@ -1462,7 +1478,7 @@ Exact encoding (implemented in `packages/protocol/src/signatures.ts`): the signe
 ### 8.6 Bridge authentication (agents)
 
 - **MVP (loopback only):** daemon binds `127.0.0.1:8787` (MCP `/mcp` and REST `/v1`). Each agent has its own bearer token (`agb token create`), stored hashed. `Origin` and `Host` headers are validated (DNS rebinding). `agb mcp` reads its token from a file passed by the agent's MCP config.
-- **Approval UI:** `127.0.0.1:8788`, separate listener, HTML only (no third-party assets), CSRF on form posts, rejects agent tokens, passphrase per approval. Token lists on this port require the passphrase.
+- **Approval UI:** `127.0.0.1:8788`, separate listener, HTML only (no third-party assets), CSRF on form posts, rejects agent tokens, passphrase per approval. Token lists on this port require the passphrase. The group view (section 6.5) is on this port. Its pages do not show a passphrase field; approve, deny, and verify still use the passphrase on the existing forms.
 - **Post-MVP hosted path:** the bridge is published through a named Cloudflare Tunnel at `https://bridge.<person-domain>/mcp`.
   - OAuth 2.1 with PKCE; `/.well-known/oauth-protected-resource/mcp` (RFC 9728); CIMD and DCR; refresh-token rotation; audience-bound tokens (RFC 8707).
   - Redirect allow-list: `https://claude.ai/api/mcp/auth_callback` and loopback for Claude Code.
@@ -1479,7 +1495,7 @@ Exact encoding (implemented in `packages/protocol/src/signatures.ts`): the signe
 - Relay: Fastify, Postgres, WebSocket, Caddy, Docker Compose on Hostinger; sequencing rules (5.1); Welcome inbox; 30-day retention job.
 - Bridge daemon: ts-mls 1.6.4 behind `MlsEngine`; SQLite with wrapped keys; policy file; crash-safe processing.
 - Agent surface: MCP (stdio proxy and loopback Streamable HTTP), REST, CLI; per-agent tokens with topic scope; the tools in section 6.2.
-- Human surface: `agb approvals` and a minimal local approval UI; contacts and fingerprints.
+- Human surface: `agb approvals`, a minimal local approval UI, contacts and fingerprints, and the group view (section 6.5).
 - Flows: init/register; create topic; invite → approve → add (Welcome + snapshot) → join accept; post/read; state get/propose with relay-ordered compare-and-swap; approvals for requests and sensitive state; remove and leave; snapshots; weekly self-Update.
 - First live test: Mohamed and a friend, each running a bridge on their own machine, with Claude Code or Claude Desktop (local MCP) agents, on a trip-planning topic.
 
